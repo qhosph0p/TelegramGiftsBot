@@ -37,7 +37,7 @@ USER_ID = int(os.getenv("TELEGRAM_USER_ID"))
 ALLOWED_USER_IDS = []
 ALLOWED_USER_IDS.append(USER_ID)
 CURRENCY = 'XTR'
-VERSION = '1.0.0'
+VERSION = '1.0.1'
 
 # --- Формирование конфигурации ---
 CONFIG_PATH = "config.json"
@@ -81,7 +81,7 @@ class AccessControlMiddleware(BaseMiddleware):
         if user and user.id not in self.allowed_user_ids:
             try:
                 if isinstance(event, Message):
-                    await event.answer("✅ Вы сможете получать подарки от этого бота.\n⛔️ У вас нет доступа к панели управления.")
+                    await event.answer("✅ Вы сможете получать подарки от этого бота.\n⛔️ У вас нет доступа к панели управления.\n\n<b>🤖 Исходный код: <a href=\"https://github.com/leozizu/TelegramGiftsBot\">GitHub</a></b>\n<b>🐸 Автор: @leozizu</b>\n<b>📢 Канал: @pepeksey</b>")
                 elif isinstance(event, CallbackQuery):
                     await event.answer("⛔️ Нет доступа", show_alert=True)
             except Exception as e:
@@ -230,6 +230,17 @@ async def change_balance(delta: int) -> int:
 
 @dp.callback_query(F.data == "show_help")
 async def help_callback(call: CallbackQuery):
+    raw_config = await load_config()
+    config = await validate_config(raw_config)
+    TARGET_USER_ID = config["TARGET_USER_ID"]
+    TARGET_CHAT_ID = config["TARGET_CHAT_ID"]
+    target_display = (
+        f"{TARGET_CHAT_ID}"
+        if TARGET_CHAT_ID
+        else f"<code>{TARGET_USER_ID}</code> (Вы)" if str(TARGET_USER_ID) == str(USER_ID)
+        else f"<code>{TARGET_USER_ID}</code>"
+    )
+
     help_text = (
         f"<b>🛠 Управление ботом (v{VERSION}):</b>\n\n"
         "<b>🟢 Включить / 🔴 Выключить</b> — запускает или останавливает покупки.\n"
@@ -242,13 +253,48 @@ async def help_callback(call: CallbackQuery):
         "❕ После изменения конфигурации, покупки автоматически не стартуют — включите 🟢 вручную.\n"
         "❗️ Получатель подарка <b>аккаунт</b> — пишите <b>id</b> пользователя (узнать можно тут @userinfobot).\n"
         "❗️ Получатель подарка <b>канал</b> — пишите <b>username</b> канала.\n"
-        "❓ Как посмотреть <b>ID транзакции</b> для возврата звёзд?  Нажми на сообщение об оплате в чате с ботом и там будет ID транзакции.\n\n"
+        "❓ Как посмотреть <b>ID транзакции</b> для возврата звёзд?  Нажми на сообщение об оплате в чате с ботом и там будет ID транзакции.\n"
+        f"✅ Хотите протестировать бот? Купите подарок 🧸 за ★15, получатель {target_display}.\n\n"
         "<b>🐸 Автор: @leozizu</b>\n"
         "<b>📢 Канал: @pepeksey</b>"
     )
+    button = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="Тест? Купить 🧸 за ★15", callback_data="buy_bear")
+        ]
+    ])
 
     await call.answer()
-    await call.message.answer(help_text)
+    await call.message.answer(help_text, reply_markup=button)
+
+@dp.callback_query(F.data == "buy_bear")
+async def buy_bear(call: CallbackQuery):
+    gift_id = '5170233102089322756'
+    raw_config = await load_config()
+    config = await validate_config(raw_config)
+    TARGET_USER_ID = config["TARGET_USER_ID"]
+    TARGET_CHAT_ID = config["TARGET_CHAT_ID"]
+    target_display = (
+        f"{TARGET_CHAT_ID}"
+        if TARGET_CHAT_ID
+        else f"<code>{TARGET_USER_ID}</code> (Вы)" if str(TARGET_USER_ID) == str(USER_ID)
+        else f"<code>{TARGET_USER_ID}</code>"
+    )
+
+    success = await buy_gift(
+        gift_id=gift_id,
+        user_id=TARGET_USER_ID,
+        chat_id=TARGET_CHAT_ID,
+        gift_price=15,
+        file_id=None
+    )
+    if not success:
+        await call.answer()
+        await call.message.answer("⚠️ Покупка подарка 🧸 за ★15 невозможна.\n💰 Пополните баланс.\n")
+        return
+    
+    await call.answer()
+    await call.message.answer(f"✅ Подарок 🧸 за ★15 куплен. Получатель: {target_display}.")
 
 @dp.callback_query(F.data == "reset_bought")
 async def reset_bought_callback(call: CallbackQuery):
