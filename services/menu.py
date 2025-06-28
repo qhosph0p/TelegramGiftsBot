@@ -31,7 +31,7 @@ def config_action_keyboard(active: bool) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text=toggle_text, callback_data="toggle_active"),
-            InlineKeyboardButton(text="✏️ Изменить", callback_data="edit_config")
+            InlineKeyboardButton(text="✏️ Изменить", callback_data="profiles_menu")
         ],
         [
             InlineKeyboardButton(text="♻️ Сбросить", callback_data="reset_bought"),

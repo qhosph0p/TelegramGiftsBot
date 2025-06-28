@@ -9,7 +9,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.exceptions import TelegramBadRequest
 
 # --- Внутренние модули ---
-from services.config import get_valid_config, get_target_display
+from services.config import get_target_display_local
 from services.menu import update_menu
 from services.gifts import get_filtered_gifts
 from services.buy import buy_gift
@@ -23,6 +23,7 @@ class CatalogFSM(StatesGroup):
     """
     waiting_gift = State()
     waiting_quantity = State()
+    waiting_recipient = State()
     waiting_confirm = State()
 
 
@@ -67,9 +68,7 @@ async def catalog(call: CallbackQuery, state: FSMContext):
         max_price=1000000,
         min_supply=0,
         max_supply=100000000,
-        unlimited = True,
-        add_test_gifts=False,
-        test_gifts_count=5
+        unlimited = True
     )
 
     # Сохраняем текущий каталог в FSM — нужен для последующих шагов
@@ -96,7 +95,6 @@ async def start_callback(call: CallbackQuery, state: FSMContext):
     await state.clear()
     await call.answer()
     await safe_edit_text(call.message, "🚫 Каталог закрыт.", reply_markup=None)
-    config = await get_valid_config(call.from_user.id)
     await refresh_balance(call.bot)
     await update_menu(
         bot=call.bot,
@@ -137,7 +135,7 @@ async def on_gift_selected(call: CallbackQuery, state: FSMContext):
 async def on_quantity_entered(message: Message, state: FSMContext):
     """
     Хендлер обработки ввода количества для покупки выбранного подарка.
-    Показывает меню с подтверждением.
+    Теперь переходим к шагу ввода получателя.
     """
     if await try_cancel(message, state):
         return
@@ -150,31 +148,67 @@ async def on_quantity_entered(message: Message, state: FSMContext):
         await message.answer("🚫 Введите целое положительное число!")
         return
     
-    data = await state.get_data()
-    gift = data.get("selected_gift")
-    gift_id = gift.get("id")
-    gift_display = f"{gift['left']:,} из {gift['supply']:,}" if gift.get("supply") != None else gift.get("emoji")
-
-    price = gift.get("price")
-    total = price * qty
     await state.update_data(selected_qty=qty)
 
-    # Клавиатура для подтверждения/отмены
+    await message.answer(
+        "👤 Введите получателя подарка:\n\n"
+        f"• <b>ID пользователя</b> (например ваш: <code>{message.from_user.id}</code>)\n"
+        "• Или <b>username канала</b> (например: <code>@channel</code>)\n\n"
+        "❗️ Узнать ID пользователя тут @userinfobot\n\n"
+        "/cancel — отменить"
+    )
+    await state.set_state(CatalogFSM.waiting_recipient)
+
+
+@wizard_router.message(CatalogFSM.waiting_recipient)
+async def on_recipient_entered(message: Message, state: FSMContext):
+    """
+    Обработка ввода получателя (ID пользователя или username канала).
+    """
+    if await try_cancel(message, state):
+        return
+
+    user_input = message.text.strip()
+    if user_input.startswith("@"):
+        target_chat_id = user_input
+        target_user_id = None
+    elif user_input.isdigit():
+        target_chat_id = None
+        target_user_id = int(user_input)
+    else:
+        await message.answer(
+            "🚫 Если получатель аккаунт — введите ID, если канал — username с @. Попробуйте ещё раз."
+        )
+        return
+
+    await state.update_data(
+        target_user_id=target_user_id,
+        target_chat_id=target_chat_id
+    )
+
+    data = await state.get_data()
+    gift = data["selected_gift"]
+    qty = data["selected_qty"]
+    price = gift.get("price")
+    total = price * qty
+
+    gift_display = f"{gift['left']:,} из {gift['supply']:,}" if gift.get("supply") != None else gift.get("emoji")
+
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"confirm_purchase"),
+                InlineKeyboardButton(text="✅ Подтвердить", callback_data="confirm_purchase"),
                 InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_purchase"),
             ]
         ]
     )
-    config = await get_valid_config(message.from_user.id)
+    recipient_display = get_target_display_local(target_user_id, target_chat_id, message.from_user.id)
     await message.answer(
         f"📦 Подарок: <b>{gift_display}</b>\n"
         f"🎁 Количество: <b>{qty}</b>\n"
         f"💵 Цена подарка: <b>★{price:,}</b>\n"
         f"💰 Общая сумма: <b>★{total:,}</b>\n"
-        f"👤 Получатель: {get_target_display(config, message.from_user.id)}",
+        f"👤 Получатель: {recipient_display}",
         reply_markup=kb
     )
     await state.set_state(CatalogFSM.waiting_confirm)
@@ -183,7 +217,7 @@ async def on_quantity_entered(message: Message, state: FSMContext):
 @wizard_router.callback_query(F.data == "confirm_purchase")
 async def confirm_purchase(call: CallbackQuery, state: FSMContext):
     """
-    Подтверждение и запуск покупки выбранного подарка в заданном количестве.
+    Подтверждение и запуск покупки выбранного подарка в заданном количестве для выбранного получателя.
     """
     data = await state.get_data()
     gift = data["selected_gift"]
@@ -195,11 +229,9 @@ async def confirm_purchase(call: CallbackQuery, state: FSMContext):
     gift_id = gift.get("id")
     gift_price = gift.get("price")
     qty = data["selected_qty"]
+    target_user_id=data.get("target_user_id")
+    target_chat_id=data.get("target_chat_id")
     gift_display = f"{gift['left']:,} из {gift['supply']:,}" if gift.get("supply") != None else gift.get("emoji")
-
-    config = await get_valid_config(call.from_user.id)
-    target_user_id = config["TARGET_USER_ID"]
-    target_chat_id = config["TARGET_CHAT_ID"]
 
     bought = 0
     while bought < qty:
@@ -216,17 +248,17 @@ async def confirm_purchase(call: CallbackQuery, state: FSMContext):
         if not success:
             break
 
-        config = await get_valid_config(call.from_user.id)
         bought += 1
         await asyncio.sleep(0.3)
 
     if bought == qty:
-        await call.message.answer(f"✅ Покупка <b>{qty}</b> x <b>{gift_display}</b> успешно завершена!\n"
+        await call.message.answer(f"✅ Покупка <b>{gift_display}</b> успешно завершена!\n"
                                   f"🎁 Куплено подарков: <b>{bought}</b> из <b>{qty}</b>\n"
-                                  f"👤 Получатель: {get_target_display(config, call.from_user.id)}")
+                                  f"👤 Получатель: {get_target_display_local(target_user_id, target_chat_id, call.from_user.id)}")
     else:
         await call.message.answer(f"⚠️ Покупка <b>{gift_display}</b> остановлена.\n"
                                   f"🎁 Куплено подарков: <b>{bought}</b> из <b>{qty}</b>\n"
+                                  f"👤 Получатель: {get_target_display_local(target_user_id, target_chat_id, call.from_user.id)}\n"
                                   f"💰 Пополните баланс!\n"
                                   f"📦 Проверьте доступность подарка!\n"
                                   f"🚦 Статус изменён на 🔴 (неактивен).")

@@ -1,17 +1,28 @@
 # --- Стандартные библиотеки ---
 import asyncio
 import logging
+import random
 
 # --- Сторонние библиотеки ---
 from aiogram.exceptions import TelegramAPIError, TelegramNetworkError, TelegramRetryAfter
 
 # --- Внутренние модули ---
-from services.config import get_valid_config, save_config
+from services.config import get_valid_config, save_config, DEV_MODE
 from services.balance import change_balance
 
 logger = logging.getLogger(__name__)
 
-async def buy_gift(bot, env_user_id, gift_id, user_id, chat_id, gift_price, file_id, retries=3):
+async def buy_gift(
+    bot,
+    env_user_id,
+    gift_id,
+    user_id,
+    chat_id,
+    gift_price,
+    file_id,
+    retries=3,
+    add_test_purchases=False
+):
     """
     Покупает подарок с заданными параметрами и количеством попыток.
     
@@ -28,6 +39,13 @@ async def buy_gift(bot, env_user_id, gift_id, user_id, chat_id, gift_price, file
     Возвращает:
         True, если покупка успешна, иначе False.
     """
+    # Тестовая логика
+    if add_test_purchases or DEV_MODE:
+        result = random.choice([True, True, True, False])
+        logger.info(f"[ТЕСТ] ({result}) Покупка подарка {gift_id} за {gift_price} (имитация, баланс не трогаем)")
+        return result
+    
+    # Обычная логика
     config = await get_valid_config(env_user_id)
     balance = config["BALANCE"]
     if balance < gift_price:

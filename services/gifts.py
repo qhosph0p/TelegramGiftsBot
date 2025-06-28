@@ -1,5 +1,6 @@
 # --- Внутренние модули ---
 from utils.mockdata import generate_test_gifts
+from services.config import DEV_MODE
 
 def normalize_gift(gift) -> dict:
     """
@@ -26,7 +27,7 @@ async def get_filtered_gifts(
     max_supply, 
     unlimited=False,
     add_test_gifts=False,
-    test_gifts_count=1
+    test_gifts_count=5
 ):
     """
     Получает и фильтрует список подарков из API, возвращает их в нормализованном виде.
@@ -41,6 +42,7 @@ async def get_filtered_gifts(
     :param test_gifts_count: Количество тестовых подарков.
     :return: Список словарей с параметрами подарков, отсортированный по цене по убыванию.
     """
+    # Получаем, нормализуем и фильтруем подарки из маркета
     api_gifts = await bot.get_available_gifts()
     filtered = []
     for gift in api_gifts.gifts:
@@ -53,9 +55,19 @@ async def get_filtered_gifts(
             supply_ok = min_supply <= supply <= max_supply
         if price_ok and supply_ok:
             filtered.append(gift)
-
     normalized = [normalize_gift(gift) for gift in filtered]
-    if add_test_gifts:
-        normalized.extend(generate_test_gifts(test_gifts_count))
-    normalized.sort(key=lambda g: g["price"], reverse=True)
-    return normalized
+
+    # Получаем и фильтруем тестовые подарки отдельно
+    test_gifts = []
+    if add_test_gifts or DEV_MODE:
+        test_gifts = generate_test_gifts(test_gifts_count)
+        test_gifts = [
+            gift for gift in test_gifts
+            if min_price <= gift["price"] <= max_price and (
+                unlimited or min_supply <= gift["supply"] <= max_supply
+            )
+        ]
+
+    all_gifts = normalized + test_gifts
+    all_gifts .sort(key=lambda g: g["price"], reverse=True)
+    return all_gifts 
