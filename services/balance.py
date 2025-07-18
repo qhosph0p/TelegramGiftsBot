@@ -1,12 +1,29 @@
 # --- Стандартные библиотеки ---
 from itertools import combinations
+import logging
 
 # --- Внутренние модули ---
 from services.config import load_config, save_config
+from services.userbot import get_userbot_stars_balance
+
+# --- Сторонние библиотеки ---
+from aiogram.types.star_amount import StarAmount
+
+logger = logging.getLogger(__name__)
 
 async def get_stars_balance(bot) -> int:
     """
-    Получает суммарный баланс звёзд по всем транзакциям пользователя через API бота.
+    Получает баланс звёзд через API бота (актуальный метод).
+    """
+    star_amount: StarAmount = await bot.get_my_star_balance()
+    balance = star_amount.amount
+
+    return balance
+
+
+async def get_stars_balance_by_transactions(bot) -> int:
+    """
+    Получает суммарный баланс звёзд по всем транзакциям пользователя через API бота (устаревший метод).
     """
     offset = 0
     limit = 100
@@ -36,9 +53,32 @@ async def refresh_balance(bot) -> int:
     """
     Обновляет и сохраняет баланс звёзд в конфиге, возвращает актуальное значение.
     """
-    balance = await get_stars_balance(bot)
+    # Загрузка конфига
     config = await load_config()
+    userbot_data = config.get("USERBOT", {})
+
+    # Баланс userbot-а (если сессия существует)
+    has_session = (
+        userbot_data.get("API_ID")
+        and userbot_data.get("API_HASH")
+        and userbot_data.get("PHONE")
+    )
+    if has_session:
+        try:
+            userbot_balance = await get_userbot_balance()
+            config["USERBOT"]["BALANCE"] = userbot_balance
+        except Exception as e:
+            config["USERBOT"]["BALANCE"] = 0
+            logger.error(f"Не удалось получить баланс userbot: {e}")
+    else:
+        logger.info("Userbot-сессия неактивна или не настроена.")
+        config["USERBOT"]["BALANCE"] = 0
+
+    # Баланс основного бота
+    balance = await get_stars_balance(bot)
     config["BALANCE"] = balance
+
+    # Сохраняем всё
     await save_config(config)
     return balance
 
@@ -52,6 +92,20 @@ async def change_balance(delta: int) -> int:
     balance = config["BALANCE"]
     await save_config(config)
     return balance
+
+
+async def change_balance_userbot(delta: int) -> int:
+    """
+    Изменяет баланс звёзд юзербота в конфиге на указанное значение delta, не допуская отрицательных значений.
+    """
+    config = await load_config()
+    userbot = config.get("USERBOT", {})
+    current = userbot.get("BALANCE", 0)
+    new_balance = max(0, current + delta)
+
+    config["USERBOT"]["BALANCE"] = new_balance
+    await save_config(config)
+    return new_balance
 
 
 async def refund_all_star_payments(bot, username, user_id, message_func=None):
@@ -156,3 +210,10 @@ async def refund_all_star_payments(bot, username, user_id, message_func=None):
         "left": left,
         "next_deposit": next_possible
     }
+
+
+async def get_userbot_balance() -> int:
+    """
+    Получает баланс звёзд у userbot-сессии.
+    """
+    return await get_userbot_stars_balance()

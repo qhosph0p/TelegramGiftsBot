@@ -64,6 +64,7 @@ async def buy_gift(
             elif user_id is None and chat_id is not None:
                 result = await bot.send_gift(gift_id=gift_id, chat_id=chat_id)
             else:
+                logger.warning("Указаны оба параметра — user_id и chat_id. Прерываем.")
                 break
 
             if result:

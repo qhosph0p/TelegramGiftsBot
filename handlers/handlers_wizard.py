@@ -13,10 +13,14 @@ from aiogram.exceptions import TelegramBadRequest, TelegramAPIError
 from services.config import get_valid_config, get_target_display, save_config
 from services.menu import update_menu, payment_keyboard
 from services.balance import refresh_balance, refund_all_star_payments
-from services.config import CURRENCY, MAX_PROFILES, add_profile, remove_profile, update_profile
+from services.config import CURRENCY, MAX_PROFILES, ALLOWED_USER_IDS, add_profile, remove_profile, update_profile
+from services.userbot import is_userbot_active, userbot_send_self, delete_userbot_session, start_userbot, continue_userbot_signin, finish_userbot_signin
+from middlewares.access_control import show_guest_menu
+from utils.misc import now_str, is_valid_profile_name, PHONE_REGEX, API_HASH_REGEX
 
 logger = logging.getLogger(__name__)
 wizard_router = Router()
+
 
 class ConfigWizard(StatesGroup):
     """
@@ -37,10 +41,386 @@ class ConfigWizard(StatesGroup):
     edit_count = State()
     edit_limit = State()
     edit_user_id = State()
+    edit_gift_sender = State()
+    gift_sender = State()
+    edit_profile_name = State()
     deposit_amount = State()
     refund_id = State()
     guest_deposit_amount = State()
-    guest_refund_id = State()
+    userbot_api_id = State()
+    userbot_api_hash = State()
+    userbot_phone = State()
+    userbot_code = State()
+    userbot_password = State()
+
+
+@wizard_router.callback_query(F.data == "userbot_menu")
+async def on_userbot_menu(call: CallbackQuery):
+    """
+    Вызывает обновление меню userbot'а после колбэка.
+    """
+    await userbot_menu(call.message, call.from_user.id)
+    await call.answer()
+
+
+async def userbot_menu(message: Message, user_id: int, edit: bool = False):
+    """
+    Формирует и отправляет (или редактирует) меню управления userbot'ом для пользователя.
+    """
+    config = await get_valid_config(user_id)
+    userbot = config.get("USERBOT", {})
+
+    userbot_username = userbot.get("USERNAME")
+    userbot_user_id = userbot.get("USER_ID")
+    phone = userbot.get("PHONE")
+    enabled = userbot.get("ENABLED", False)
+
+    if is_userbot_active(user_id):
+        status_button = InlineKeyboardButton(
+            text="🔕 Выключить" if enabled else "🔔 Включить",
+            callback_data="userbot_disable" if enabled else "userbot_enable"
+        )
+        text = (
+            "✅ <b>Юзербот подключён.</b>\n\n"
+            f"┌ <b>Пользователь:</b> {'@' + userbot_username if userbot_username else '—'} (<code>{userbot_user_id}</code>)\n"
+            f"├ <b>Номер:</b> <code>{phone or '—'}</code>\n"
+            f"└ <b>Статус:</b> {'🔔 Включён ' if enabled else '🔕 Выключен'}\n\n"
+            f"❗️ Статус 🔕 <b>приостанавливает</b> работу <b>юзербота</b>."
+        )
+        keyboard = [
+            [
+                status_button,
+                InlineKeyboardButton(text="🗑 Удалить", callback_data="userbot_confirm_delete")
+            ],
+            [
+                InlineKeyboardButton(text="📘 Инструкция", callback_data="show_userbot_help"),
+                InlineKeyboardButton(text="☰ Меню", callback_data="userbot_main_menu")
+            ]
+        ]
+    else:
+        text = (
+            "🚫 <b>Юзербот не подключён.</b>\n\n"
+            "📋 <b>Подготовьте следующие данные:</b>\n\n"
+            "🔸 <code>api_id</code>\n"
+            "🔸 <code>api_hash</code>\n"
+            "🔸 <code>Номер телефона</code>\n\n"
+            "📎 Получить <b><a href=\"https://my.telegram.org\">API данные</a></b>\n"
+            "📜 Прочитать <b><a href=\"https://core.telegram.org/api/terms\">условия использования</a></b>" 
+        )
+        keyboard = [
+            [InlineKeyboardButton(text="➕ Подключить юзербот", callback_data="init_userbot")],
+            [InlineKeyboardButton(text="📘 Инструкция", callback_data="show_userbot_help")],
+            [InlineKeyboardButton(text="☰ Меню", callback_data="userbot_main_menu")]
+        ]
+
+    markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+    try:
+        if edit:
+            await message.edit_text(text, reply_markup=markup, disable_web_page_preview=True)
+        else:
+            await message.answer(text, reply_markup=markup, disable_web_page_preview=True)
+    except Exception as e:
+        logger.error(f"⚠️ Ошибка при обновлении меню: {e}")
+
+
+@wizard_router.callback_query(F.data == "userbot_confirm_delete")
+async def confirm_userbot_delete(call: CallbackQuery):
+    """
+    Запрашивает подтверждение удаления userbot-сессии у пользователя.
+    """
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Да", callback_data="userbot_delete_yes"),
+            InlineKeyboardButton(text="❌ Нет", callback_data="userbot_delete_no")
+        ]
+    ])
+    await call.message.edit_text(
+        "❗ Вы уверены, что хотите <b>удалить юзербот</b>?",
+        reply_markup=kb
+    )
+    await call.answer()
+
+
+@wizard_router.callback_query(F.data == "userbot_delete_no")
+async def cancel_userbot_delete(call: CallbackQuery):
+    """
+    Отменяет процесс удаления userbot-сессии и возвращает в меню.
+    """
+    user_id = call.from_user.id
+    await call.answer("Отменено.")
+    await userbot_menu(call.message, user_id, edit=True)
+
+
+@wizard_router.callback_query(F.data == "userbot_delete_yes")
+async def userbot_delete_handler(call: CallbackQuery):
+    """
+    Удаляет данные userbot-сессии из конфигурации пользователя.
+    """
+    user_id = call.from_user.id
+    success = await delete_userbot_session(user_id)
+
+    if success:
+        await call.message.answer("✅ Юзербот удалён.")
+        await userbot_menu(call.message, user_id, edit=False)
+    else:
+        await call.message.answer("🚫 Не удалось удалить юзербот. Возможно, он уже был удалена.")
+        await userbot_menu(call.message, user_id, edit=False)
+
+    await call.answer()
+
+
+@wizard_router.callback_query(F.data == "userbot_enable")
+async def userbot_enable_handler(call: CallbackQuery):
+    """
+    Включает userbot-сессию в конфигурации и обновляет меню.
+    """
+    user_id = call.from_user.id
+    username = call.from_user.username
+    bot_user = await call.bot.get_me()
+    bot_username = bot_user.username
+    config = await get_valid_config(user_id)
+    config["USERBOT"]["ENABLED"] = True
+    await save_config(config)
+
+    await call.answer()
+
+    text_message = (
+        f"🔔 <b>Юзербот включён.</b>\n\n"
+        f"┌🤖 <b>Бот:</b> @{bot_username}\n"
+        f"├👤 <b>Пользователь:</b> @{username} (<code>{user_id}</code>)\n"
+        f"└🕒 <b>Время:</b> {now_str()} (UTC)"
+    )
+    success_send_message = await userbot_send_self(user_id, text_message)
+
+    if success_send_message:
+        logger.info("Юзербот успешно включён.")
+    else:
+        logger.error("Юзербот успешно включён, но сообщение не удалось отправить.")
+
+    await userbot_menu(call.message, user_id, edit=True)
+
+
+@wizard_router.callback_query(F.data == "userbot_disable")
+async def userbot_disable_handler(call: CallbackQuery):
+    """
+    Отключает userbot-сессию в конфигурации и обновляет меню.
+    """
+    user_id = call.from_user.id
+    username = call.from_user.username
+    bot_user = await call.bot.get_me()
+    bot_username = bot_user.username
+    config = await get_valid_config(user_id)
+    config["USERBOT"]["ENABLED"] = False
+    await save_config(config)
+
+    await call.answer()
+
+    text_message = (
+        f"🔕 <b>Юзербот выключен.</b>\n\n"
+        f"┌🤖 <b>Бот:</b> @{bot_username}\n"
+        f"├👤 <b>Пользователь:</b> @{username} (<code>{user_id}</code>)\n"
+        f"└🕒 <b>Время:</b> {now_str()} (UTC)"
+    )
+    success_send_message = await userbot_send_self(user_id, text_message)
+
+    if success_send_message:
+        logger.info("Юзербот успешно выключен.")
+    else:
+        logger.error("Юзербот успешно выключен, но сообщение не удалось отправить.")
+
+    await userbot_menu(call.message, user_id, edit=True)
+
+
+@wizard_router.callback_query(F.data == "init_userbot")
+async def init_userbot_handler(call: CallbackQuery, state: FSMContext):
+    """
+    Запускает процесс подключения новой userbot-сессии (шаг ввода api_id).
+    """
+    await call.message.answer("📥 Введите <b>api_id</b>:\n\n/cancel — отмена")
+    await state.set_state(ConfigWizard.userbot_api_id)
+    await call.answer()
+
+
+@wizard_router.message(ConfigWizard.userbot_api_id)
+async def get_api_id(message: Message, state: FSMContext):
+    """
+    Обрабатывает ввод api_id от пользователя и переходит к следующему шагу.
+    """
+    if await try_cancel(message, state):
+        return
+    
+    if not message.text:
+        await message.answer("🚫 Поддерживается только текстовый ввод данных.\n\n/cancel — отмена")
+        return
+    
+    text = message.text.strip()
+
+    if not text.isdigit() or not (10000 <= int(text) <= 9999999999):
+        await message.answer("🚫 Неверный формат. Введите корректное число.\n\n/cancel — отмена")
+        return
+    
+    value = int(text)
+    await state.update_data(api_id=value)
+    await message.answer("📥 Введите <b>api_hash</b>:\n\n/cancel — отмена")
+    await state.set_state(ConfigWizard.userbot_api_hash)
+
+
+@wizard_router.message(ConfigWizard.userbot_api_hash)
+async def get_api_hash(message: Message, state: FSMContext):
+    """
+    Обрабатывает ввод api_hash и переходит к шагу ввода номера телефона.
+    """
+    if await try_cancel(message, state):
+        return
+    
+    if not message.text:
+        await message.answer("🚫 Поддерживается только текстовый ввод данных.\n\n/cancel — отмена")
+        return
+    
+    api_hash = message.text.strip()
+
+    if not API_HASH_REGEX.fullmatch(api_hash):
+        await message.answer("🚫 Неверный формат. Убедитесь, что api_hash скопирован полностью (32 символа).\n\n/cancel — отмена")
+        return
+
+    await state.update_data(api_hash=api_hash)
+    await message.answer("📥 Введите номер телефона (в формате <code>+490123456789</code>):\n\n/cancel — отмена")
+    await state.set_state(ConfigWizard.userbot_phone)
+
+
+@wizard_router.message(ConfigWizard.userbot_phone)
+async def get_phone(message: Message, state: FSMContext):
+    """
+    Сохраняет номер телефона и инициирует отправку кода подтверждения.
+    """
+    if await try_cancel(message, state):
+        return
+    
+    if not message.text:
+        await message.answer("🚫 Поддерживается только текстовый ввод данных.\n\n/cancel — отмена")
+        return
+    
+    raw_phone = message.text.strip()
+    phone = raw_phone.replace(" ", "")
+
+    if not PHONE_REGEX.match(phone):
+        await message.answer("🚫 Неверный формат номера телефона.\nВведите в формате: <code>+490123456789</code>\n\n/cancel — отмена")
+        return
+    
+    await state.update_data(phone=phone)
+
+    success = await start_userbot(message, state)
+    if not success:
+        await userbot_menu(message, message.from_user.id, edit=False)
+        await state.clear()
+        return
+    await message.answer("📥 Введите полученный код:\n\n/cancel — отмена")
+    await state.set_state(ConfigWizard.userbot_code)
+
+
+@wizard_router.message(ConfigWizard.userbot_code)
+async def get_code(message: Message, state: FSMContext):
+    """
+    Обрабатывает код подтверждения и при необходимости запрашивает пароль.
+    """
+    if await try_cancel(message, state):
+        return
+    
+    if not message.text:
+        await message.answer("🚫 Поддерживается только текстовый ввод данных.\n\n/cancel — отмена")
+        return
+    
+    await state.update_data(code=message.text.strip())
+    success, need_password, retry = await continue_userbot_signin(message, state)
+    if retry:
+        return
+    if not success:
+        await message.answer("🚫 Ошибка кода. Подключение юзербота прервано.")
+        await userbot_menu(message, message.from_user.id, edit=False)
+        await state.clear()
+        return
+    if need_password:
+        await message.answer("📥 Введите пароль:\n\n/cancel — отмена")
+        await state.set_state(ConfigWizard.userbot_password)
+    else:
+        user_id = message.from_user.id
+        username = message.from_user.username
+        bot_user = await message.bot.get_me()
+        bot_username = bot_user.username
+        text_message = (
+            f"✅ <b>Юзербот успешно подключён.</b>\n"
+            f"┌🤖 <b>Бот:</b> @{bot_username}\n"
+            f"├👤 <b>Пользователь:</b> @{username} (<code>{user_id}</code>)\n"
+            f"└🕒 <b>Время:</b> {now_str()} (UTC)"
+        )
+        success_send_message = await userbot_send_self(user_id, text_message)
+
+        if success_send_message:
+            await message.answer("✅ Юзербот успешно подключён.")
+        else:
+            await message.answer("✅ Юзербот успешно подключён.\n🚫 Ошибка при отправке подтверждения.")
+
+        await userbot_menu(message, message.from_user.id, edit=False)
+        await state.clear()
+
+
+@wizard_router.message(ConfigWizard.userbot_password)
+async def get_password(message: Message, state: FSMContext):
+    """
+    Обрабатывает ввод пароля от Telegram-аккаунта и завершает авторизацию userbot'а.
+    """
+    if await try_cancel(message, state):
+        return
+    
+    if not message.text:
+        await message.answer("🚫 Поддерживается только текстовый ввод данных.\n\n/cancel — отмена")
+        return
+    
+    await state.update_data(password=message.text.strip())
+    success, retry = await finish_userbot_signin(message, state)
+    if retry:
+        return
+    if success:
+        user_id = message.from_user.id
+        username = message.from_user.username
+        bot_user = await message.bot.get_me()
+        bot_username = bot_user.username
+        text_message = (
+            f"✅ <b>Юзербот успешно подключён.</b>\n"
+            f"┌🤖 <b>Бот:</b> @{bot_username}\n"
+            f"├👤 <b>Пользователь:</b> @{username} (<code>{user_id}</code>)\n"
+            f"└🕒 <b>Время:</b> {now_str()} (UTC)"
+        )
+        success_send_message = await userbot_send_self(user_id, text_message)
+
+        if success_send_message:
+            await message.answer("✅ Юзербот успешно подключён.")
+        else:
+            await message.answer("✅ Юзербот успешно подключён.\n🚫 Ошибка при отправке подтверждения.")
+    else:
+        await message.answer("🚫 Неверный пароль. Подключение юзербота прервано.")
+
+    await userbot_menu(message, message.from_user.id, edit=False)
+    await state.clear()
+
+
+@wizard_router.callback_query(F.data == "userbot_main_menu")
+async def userbot_main_menu_callback(call: CallbackQuery, state: FSMContext):
+    """
+    Показывает главное меню по нажатию кнопки "Меню".
+    Очищает все состояния FSM для пользователя.
+    """
+    await state.clear()
+    await call.answer()
+    await safe_edit_text(call.message, "✅ Настройка юзербота завершена.", reply_markup=None)
+    await refresh_balance(call.bot)
+    await update_menu(
+        bot=call.bot,
+        chat_id=call.message.chat.id,
+        user_id=call.from_user.id,
+        message_id=call.message.message_id
+    )
 
 
 async def profiles_menu(message: Message, user_id: int):
@@ -54,9 +434,10 @@ async def profiles_menu(message: Message, user_id: int):
     # Формируем клавиатуру профилей
     keyboard = []
     for idx, profile in enumerate(profiles):
+        profile_name = f'Профиль {idx + 1}' if  not profile['NAME'] else profile['NAME']
         btns = [
             InlineKeyboardButton(
-                text=f"✏️ Профиль {idx+1}", callback_data=f"profile_edit_{idx}"
+                text=f"✏️ {profile_name}", callback_data=f"profile_edit_{idx}"
             ),
             InlineKeyboardButton(
                 text="🗑 Удалить", callback_data=f"profile_delete_{idx}"
@@ -67,22 +448,27 @@ async def profiles_menu(message: Message, user_id: int):
     if len(profiles) < MAX_PROFILES:
         keyboard.append([InlineKeyboardButton(text="➕ Добавить", callback_data="profile_add")])
     # Кнопка назад
-    keyboard.append([InlineKeyboardButton(text="☰ Вернуться в меню", callback_data="profiles_main_menu")])
+    keyboard.append([InlineKeyboardButton(text="☰ Меню", callback_data="profiles_main_menu")])
 
     profiles = config.get("PROFILES", [])
 
     lines = []
     for idx, profile in enumerate(profiles, 1):
         target_display = get_target_display(profile, user_id)
-        if idx == 1 and len(profiles) == 1: line = (f"🔘 <b>Профиль {idx}</b> – {target_display}")
-        elif idx == 1: line = (f"┌🔘 <b>Профиль {idx}</b> – {target_display}")
-        elif len(profiles) == idx: line = (f"└🔘 <b>Профиль {idx}</b> – {target_display}")
-        else: line = (f"├🔘 <b>Профиль {idx}</b> – {target_display}")
+        profile_name = f'Профиль {idx}' if  not profile['NAME'] else profile['NAME']
+        sender = '<code>Бот</code>' if profile['SENDER'] == 'bot' else '<code>Юзербот</code>'
+        if idx == 1 and len(profiles) == 1: line = (f"🏷️ <b>{profile_name} {sender}</b> → {target_display}")
+        elif idx == 1: line = (f"┌🏷️ <b>{profile_name} {sender}</b> → {target_display}")
+        elif len(profiles) == idx: line = (f"└🏷️ <b>{profile_name} {sender}</b> → {target_display}")
+        else: line = (f"├🏷️ <b>{profile_name} {sender}</b> → {target_display}")
         lines.append(line)
     text_profiles = "\n".join(lines)
 
     kb = InlineKeyboardMarkup(inline_keyboard=keyboard)
-    await message.answer(f"📝 <b>Управление профилями (максимум 3):</b>\n\n{text_profiles}", reply_markup=kb)
+    await message.answer(f"📝 <b>Управление профилями (максимум 3):</b>\n\n"
+                         f"{text_profiles}\n\n"
+                         "👉 <b>Нажмите</b> ✏️ чтобы изменить профиль.\n", 
+                         reply_markup=kb)
 
 
 @wizard_router.callback_query(F.data == "profiles_menu")
@@ -102,12 +488,15 @@ def profile_text(profile, idx, user_id):
     Используется для вывода информации при редактировании профиля.
     """
     target_display = get_target_display(profile, user_id)
-    return (f"✏️ <b>Изменение профиля {idx+1}</b>:\n\n"
+    profile_name = f'Профиль {idx + 1}' if  not profile['NAME'] else profile['NAME']
+    sender = '<code>Бот</code>' if profile['SENDER'] == 'bot' else '<code>Юзербот</code>'
+    return (f"✏️ <b>Изменение {profile_name}</b>:\n\n"
             f"┌💰 <b>Цена</b>: {profile.get('MIN_PRICE'):,} – {profile.get('MAX_PRICE'):,} ★\n"
             f"├📦 <b>Саплай</b>: {profile.get('MIN_SUPPLY'):,} – {profile.get('MAX_SUPPLY'):,}\n"
             f"├🎁 <b>Куплено</b>: {profile.get('BOUGHT'):,} / {profile.get('COUNT'):,}\n"
             f"├⭐️ <b>Лимит</b>: {profile.get('SPENT'):,} / {profile.get('LIMIT'):,} ★\n"
-            f"└👤 <b>Получатель</b>: {target_display}")
+            f"├👤 <b>Получатель</b>: {target_display}\n"
+            f"└📤 <b>Отправитель</b>: {sender}")
 
 
 def profile_edit_keyboard(idx):
@@ -127,7 +516,14 @@ def profile_edit_keyboard(idx):
             ],
             [
                 InlineKeyboardButton(text="👤 Получатель", callback_data=f"edit_profile_target_{idx}"),
+                InlineKeyboardButton(text="📤 Отправитель", callback_data=f"edit_profile_sender_{idx}")
+            ],
+            [
+                InlineKeyboardButton(text="🏷️ Название", callback_data=f"edit_profile_name_{idx}"),
                 InlineKeyboardButton(text="⬅️ Назад", callback_data=f"edit_profiles_menu_{idx}")
+            ],
+            [
+                InlineKeyboardButton(text="☰ Меню", callback_data="profiles_main_menu")
             ]
         ]
     )
@@ -151,6 +547,48 @@ async def on_profile_edit(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
 
+@wizard_router.message(ConfigWizard.edit_profile_name)
+async def on_profile_name_entered(message: Message, state: FSMContext):
+    """
+    Обработка ввода нового имени профиля.
+    """
+    if await try_cancel(message, state):
+        return
+    
+    if not message.text:
+        await message.answer("🚫 Поддерживается только текстовый ввод данных.\n\n/cancel — отмена")
+        return
+    
+    name = message.text.strip()
+    if not is_valid_profile_name(name):
+        await message.answer("🚫 Имя должно содержать только буквы (русские и латинские) и цифры, "
+                             "и быть не длиннее 12 символов. Попробуйте ещё раз.\n\n"
+                             "/cancel — отменить")
+        return
+
+    data = await state.get_data()
+    idx = data.get("profile_index")
+    if idx is None:
+        await message.answer("Ошибка: не выбран профиль для переименования.")
+        await state.clear()
+        return
+
+    config = await get_valid_config(message.from_user.id)
+    profiles = config.get("PROFILES", [])
+    if idx < 0 or idx >= len(profiles):
+        await message.answer("Ошибка: профиль не найден.")
+        await state.clear()
+        return
+
+    profiles[idx]["NAME"] = name
+    await save_config(config)
+    await message.answer(f"✅ Имя профиля успешно изменено на: <b>{name}</b>")
+
+    # Вернуться к меню профилей (вызывайте свою функцию профилей)
+    await profiles_menu(message, message.from_user.id)
+    await state.clear()
+
+
 @wizard_router.callback_query(lambda c: c.data.startswith("edit_profile_price_"))
 async def edit_profile_min_price(call: CallbackQuery, state: FSMContext):
     """
@@ -160,7 +598,13 @@ async def edit_profile_min_price(call: CallbackQuery, state: FSMContext):
     idx = int(call.data.split("_")[-1])
     await state.update_data(profile_index=idx)
     await state.update_data(message_id=call.message.message_id)
-    await call.message.answer(f"✏️ <b>Редактирование профиля {idx + 1}:</b>\n\n💰 Минимальная цена подарка, например: <code>5000</code>\n\n/cancel — отменить")
+    config = await get_valid_config(call.from_user.id)
+    profiles = config.get("PROFILES", [])
+    profile = profiles[idx]
+    profile_name = f'профиля {idx+1}' if  not profile['NAME'] else profile['NAME']
+    await call.message.answer(f"✏️ <b>Редактирование {profile_name}:</b>\n\n"
+                              "💰 Минимальная цена подарка, например: <code>5000</code>\n\n"
+                              "/cancel — отменить")
     await state.set_state(ConfigWizard.edit_min_price)
     await call.answer()
 
@@ -174,7 +618,13 @@ async def edit_profile_min_supply(call: CallbackQuery, state: FSMContext):
     idx = int(call.data.split("_")[-1])
     await state.update_data(profile_index=idx)
     await state.update_data(message_id=call.message.message_id)
-    await call.message.answer(f"✏️ <b>Редактирование профиля {idx + 1}:</b>\n\n📦 Минимальный саплай подарка, например: <code>1000</code>\n\n/cancel — отменить")
+    config = await get_valid_config(call.from_user.id)
+    profiles = config.get("PROFILES", [])
+    profile = profiles[idx]
+    profile_name = f'профиля {idx+1}' if  not profile['NAME'] else profile['NAME']
+    await call.message.answer(f"✏️ <b>Редактирование {profile_name}:</b>\n\n"
+                              "📦 Минимальный саплай подарка, например: <code>1000</code>\n\n"
+                              "/cancel — отменить")
     await state.set_state(ConfigWizard.edit_min_supply)
     await call.answer()
 
@@ -188,11 +638,13 @@ async def edit_profile_limit(call: CallbackQuery, state: FSMContext):
     idx = int(call.data.split("_")[-1])
     await state.update_data(profile_index=idx)
     await state.update_data(message_id=call.message.message_id)
-    await call.message.answer(
-            f"✏️ <b>Редактирование профиля {idx + 1}:</b>\n\n"
-            "⭐️ Введите лимит звёзд для этого профиля (например: <code>10000</code>)\n\n"
-            "/cancel — отменить"
-        )
+    config = await get_valid_config(call.from_user.id)
+    profiles = config.get("PROFILES", [])
+    profile = profiles[idx]
+    profile_name = f'профиля {idx+1}' if  not profile['NAME'] else profile['NAME']
+    await call.message.answer(f"✏️ <b>Редактирование {profile_name}:</b>\n\n"
+                              "⭐️ Введите лимит звёзд для этого профиля (например: <code>10000</code>)\n\n"
+                              "/cancel — отменить")
     await state.set_state(ConfigWizard.edit_limit)
     await call.answer()
 
@@ -206,7 +658,13 @@ async def edit_profile_count(call: CallbackQuery, state: FSMContext):
     idx = int(call.data.split("_")[-1])
     await state.update_data(profile_index=idx)
     await state.update_data(message_id=call.message.message_id)
-    await call.message.answer(f"✏️ <b>Редактирование профиля {idx + 1}:</b>\n\n🎁 Максимальное количество подарков, например: <code>5</code>\n\n/cancel — отменить")
+    config = await get_valid_config(call.from_user.id)
+    profiles = config.get("PROFILES", [])
+    profile = profiles[idx]
+    profile_name = f'профиля {idx+1}' if  not profile['NAME'] else profile['NAME']
+    await call.message.answer(f"✏️ <b>Редактирование {profile_name}:</b>\n\n"
+                              "🎁 Максимальное количество подарков, например: <code>5</code>\n\n"
+                              "/cancel — отменить")
     await state.set_state(ConfigWizard.edit_count)
     await call.answer()
 
@@ -220,16 +678,94 @@ async def edit_profile_target(call: CallbackQuery, state: FSMContext):
     idx = int(call.data.split("_")[-1])
     await state.update_data(profile_index=idx)
     await state.update_data(message_id=call.message.message_id)
-    await call.message.answer(
-            f"✏️ <b>Редактирование профиля {idx + 1}:</b>\n\n"
-            "👤 Введите адрес получателя:\n\n"
-            f"• <b>ID пользователя</b> (например ваш: <code>{call.from_user.id}</code>)\n"
-            "• Или <b>username канала</b> (например: <code>@channel</code>)\n\n"
-            "❗️ Узнать ID пользователя тут @userinfobot\n\n"
-            "/cancel — отменить"
-        )
+    config = await get_valid_config(call.from_user.id)
+    profiles = config.get("PROFILES", [])
+    profile = profiles[idx]
+    profile_name = f'профиля {idx+1}' if  not profile['NAME'] else profile['NAME']
+    message_text = (f"✏️ <b>Редактирование {profile_name}:</b>\n\n"
+                    "📥 Введите <b>получателя</b> подарка:\n\n"
+                    "🤖 Если <b>отправитель</b> <code>Бот</code> введите:\n"
+                    f"➤ <b>ID пользователя</b> (например ваш: <code>{call.from_user.id}</code>)\n"
+                    "➤ <b>username канала</b> (например: <code>@pepeksey</code>)\n\n"
+                    "👤 Если <b>отправитель</b> <code>Юзербот</code> введите:\n"
+                    "➤ <b>username</b> пользователя (например: <code>@leozizu</code>)\n"
+                    "➤ <b>username</b> канала (например: <code>@pepeksey</code>)\n\n"
+                    "🔎 <b>Узнать ID пользователя</b> можно тут: @userinfobot\n\n"
+                    "⚠️ Чтобы аккаунт <code>Юзербота</code> отправил подарок на другой аккаунт, между аккаунтами должна быть переписка.\n\n"
+                    "/cancel — отменить")
+    await call.message.answer(message_text)
     await state.set_state(ConfigWizard.edit_user_id)
     await call.answer()
+
+
+@wizard_router.callback_query(lambda c: c.data.startswith("edit_profile_name_"))
+async def edit_profile_name(call: CallbackQuery, state: FSMContext):
+    """
+    Кнопка "Переименовать профиль". Сохраняет индекс и ждет новое имя.
+    """
+    idx = int(call.data.split("_")[-1])
+    await state.update_data(profile_index=idx)
+    await call.message.answer(f"✏️ Введите новое имя для профиля {idx + 1}: (до 12 символов)\n\n"
+                              "/cancel — отменить")
+    await state.set_state(ConfigWizard.edit_profile_name)
+    await call.answer()
+
+
+@wizard_router.callback_query(lambda c: c.data.startswith("edit_profile_sender_"))
+async def edit_profile_sender(call: CallbackQuery, state: FSMContext):
+    idx = int(call.data.removeprefix("edit_profile_sender_"))
+    config = await get_valid_config(call.from_user.id)
+    profiles = config.get("PROFILES", [])
+
+    if idx >= len(profiles):
+        await call.answer("Профиль не найден.", show_alert=True)
+        return
+
+    profile = profiles[idx]
+
+    # Сохраняем профиль в FSM (будем его редактировать)
+    await state.set_state(ConfigWizard.edit_gift_sender)
+    await state.update_data(profile_data=profile, profile_index=idx)
+
+    profile_name = f'профиля {idx+1}' if  not profile['NAME'] else profile['NAME']
+    await call.message.edit_text(f"✏️ <b>Редактирование {profile_name}:</b>\n\n"
+                                 "📤 Выберите <b>отправителя</b> подарков:\n\n"
+                                 "🤖 <code>Бот</code> - покупки с баланса бота\n"
+                                 "👤 <code>Юзербот</code> - покупки с баланса юзербота\n\n"
+                                 "❗️ Если отправитель <code>Юзербот</code>, убедитесь, что он <b>включён</b> 🔔\n\n"
+                                 "/cancel — отменить",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🤖 Бот", callback_data="choose_sender_bot"),
+                InlineKeyboardButton(text="👤 Юзербот", callback_data="choose_sender_userbot")
+            ]
+        ])
+    )
+    await call.answer()
+
+
+@wizard_router.message(ConfigWizard.gift_sender)
+async def handle_gift_sender_input(message: Message, state: FSMContext):
+    """
+    Обрабатывает ввод на шаге выбора отправителя. Позволяет отменить командой /cancel.
+    """
+    if await try_cancel(message, state):
+        return
+
+    await message.answer("❗ Пожалуйста, выберите отправителя с помощью кнопок.\n\n"
+                         "/cancel — отменить")
+
+
+@wizard_router.message(ConfigWizard.edit_gift_sender)
+async def handle_gift_sender_input(message: Message, state: FSMContext):
+    """
+    Обрабатывает ввод на шаге выбора отправителя. Позволяет отменить командой /cancel.
+    """
+    if await try_cancel(message, state):
+        return
+
+    await message.answer("❗ Пожалуйста, выберите отправителя с помощью кнопок.\n\n"
+                         "/cancel — отменить")
 
 
 @wizard_router.callback_query(lambda c: c.data.startswith("edit_profiles_menu_"))
@@ -239,7 +775,11 @@ async def edit_profiles_menu(call: CallbackQuery):
     Открывает пользователю общий список всех профилей.
     """
     idx = int(call.data.split("_")[-1])
-    await safe_edit_text(call.message, f"✅ Редактирование <b>профиля {idx + 1}</b> завершено.", reply_markup=None)
+    config = await get_valid_config(call.from_user.id)
+    profiles = config.get("PROFILES", [])
+    profile = profiles[idx]
+    profile_name = f'профиля {idx+1}' if  not profile['NAME'] else profile['NAME']
+    await safe_edit_text(call.message, f"✅ Редактирование <b>{profile_name}</b> завершено.", reply_markup=None)
     await profiles_menu(call.message, call.from_user.id)
     await call.answer()
 
@@ -253,6 +793,10 @@ async def step_edit_min_price(message: Message, state: FSMContext):
     if await try_cancel(message, state):
         return
     
+    if not message.text:
+        await message.answer("🚫 Поддерживается только текстовый ввод данных.\n\n/cancel — отмена")
+        return
+    
     data = await state.get_data()
     idx = data["profile_index"]
     
@@ -261,10 +805,16 @@ async def step_edit_min_price(message: Message, state: FSMContext):
         if value <= 0:
             raise ValueError
         await state.update_data(MIN_PRICE=value)
-        await message.answer(f"✏️ <b>Редактирование профиля {idx + 1}:</b>\n\n💰 Максимальная цена подарка, например: <code>10000</code>\n\n/cancel — отменить")
+        config = await get_valid_config(message.from_user.id)
+        profiles = config.get("PROFILES", [])
+        profile = profiles[idx]
+        profile_name = f'профиля {idx+1}' if  not profile['NAME'] else profile['NAME']
+        await message.answer(f"✏️ <b>Редактирование {profile_name}:</b>\n\n"
+                             "💰 Максимальная цена подарка, например: <code>10000</code>\n\n"
+                             "/cancel — отменить")
         await state.set_state(ConfigWizard.edit_max_price)
     except ValueError:
-        await message.answer("🚫 Введите положительное число. Попробуйте ещё раз.")
+        await message.answer("🚫 Введите положительное число. Попробуйте ещё раз.\n\n/cancel — отмена")
 
 
 @wizard_router.message(ConfigWizard.edit_max_price)
@@ -274,6 +824,10 @@ async def step_edit_max_price(message: Message, state: FSMContext):
     Проверяет валидность, сохраняет и возвращает пользователя в меню профиля.
     """
     if await try_cancel(message, state):
+        return
+    
+    if not message.text:
+        await message.answer("🚫 Поддерживается только текстовый ввод данных.\n\n/cancel — отмена")
         return
     
     data = await state.get_data()
@@ -287,7 +841,7 @@ async def step_edit_max_price(message: Message, state: FSMContext):
         data = await state.get_data()
         min_price = data.get("MIN_PRICE")
         if min_price and value < min_price:
-            await message.answer("🚫 Максимальная цена не может быть меньше минимальной. Попробуйте ещё раз.")
+            await message.answer("🚫 Максимальная цена не может быть меньше минимальной. Попробуйте ещё раз.\n\n/cancel — отмена")
             return
 
         config = await get_valid_config(message.from_user.id)
@@ -306,7 +860,7 @@ async def step_edit_max_price(message: Message, state: FSMContext):
         )
         await state.clear()
     except ValueError:
-        await message.answer("🚫 Введите положительное число. Попробуйте ещё раз.")
+        await message.answer("🚫 Введите положительное число. Попробуйте ещё раз.\n\n/cancel — отмена")
 
 
 @wizard_router.message(ConfigWizard.edit_min_supply)
@@ -318,6 +872,10 @@ async def step_edit_min_supply(message: Message, state: FSMContext):
     if await try_cancel(message, state):
         return
     
+    if not message.text:
+        await message.answer("🚫 Поддерживается только текстовый ввод данных.\n\n/cancel — отмена")
+        return
+    
     data = await state.get_data()
     idx = data["profile_index"]
     
@@ -326,10 +884,16 @@ async def step_edit_min_supply(message: Message, state: FSMContext):
         if value <= 0:
             raise ValueError
         await state.update_data(MIN_SUPPLY=value)
-        await message.answer(f"✏️ <b>Редактирование профиля {idx + 1}:</b>\n\n📦 Максимальный саплай подарка, например: <code>10000</code>\n\n/cancel — отменить")
+        config = await get_valid_config(message.from_user.id)
+        profiles = config.get("PROFILES", [])
+        profile = profiles[idx]
+        profile_name = f'профиля {idx+1}' if  not profile['NAME'] else profile['NAME']
+        await message.answer(f"✏️ <b>Редактирование {profile_name}:</b>\n\n"
+                             "📦 Максимальный саплай подарка, например: <code>10000</code>\n\n"
+                             "/cancel — отменить")
         await state.set_state(ConfigWizard.edit_max_supply)
     except ValueError:
-        await message.answer("🚫 Введите положительное число. Попробуйте ещё раз.")
+        await message.answer("🚫 Введите положительное число. Попробуйте ещё раз.\n\n/cancel — отмена")
 
 
 @wizard_router.message(ConfigWizard.edit_max_supply)
@@ -339,6 +903,10 @@ async def step_edit_max_supply(message: Message, state: FSMContext):
     Проверяет валидность, сохраняет и возвращает пользователя в меню профиля.
     """
     if await try_cancel(message, state):
+        return
+    
+    if not message.text:
+        await message.answer("🚫 Поддерживается только текстовый ввод данных.\n\n/cancel — отмена")
         return
     
     data = await state.get_data()
@@ -352,7 +920,7 @@ async def step_edit_max_supply(message: Message, state: FSMContext):
         data = await state.get_data()
         min_supply = data.get("MIN_SUPPLY")
         if min_supply and value < min_supply:
-            await message.answer("🚫 Максимальный саплай не может быть меньше минимального. Попробуйте ещё раз.")
+            await message.answer("🚫 Максимальный саплай не может быть меньше минимального. Попробуйте ещё раз.\n\n/cancel — отмена")
             return
         
         config = await get_valid_config(message.from_user.id)
@@ -371,7 +939,7 @@ async def step_edit_max_supply(message: Message, state: FSMContext):
         )
         await state.clear()
     except ValueError:
-        await message.answer("🚫 Введите положительное число. Попробуйте ещё раз.")
+        await message.answer("🚫 Введите положительное число. Попробуйте ещё раз.\n\n/cancel — отмена")
 
 
 @wizard_router.message(ConfigWizard.edit_limit)
@@ -381,6 +949,10 @@ async def step_edit_limit(message: Message, state: FSMContext):
     Проверяет валидность, сохраняет и возвращает пользователя в меню профиля.
     """
     if await try_cancel(message, state):
+        return
+    
+    if not message.text:
+        await message.answer("🚫 Поддерживается только текстовый ввод данных.\n\n/cancel — отмена")
         return
 
     data = await state.get_data()
@@ -406,7 +978,7 @@ async def step_edit_limit(message: Message, state: FSMContext):
         )
         await state.clear()
     except ValueError:
-        await message.answer("🚫 Введите положительное число. Попробуйте ещё раз.")
+        await message.answer("🚫 Введите положительное число. Попробуйте ещё раз.\n\n/cancel — отмена")
 
 
 @wizard_router.message(ConfigWizard.edit_count)
@@ -416,6 +988,10 @@ async def step_edit_count(message: Message, state: FSMContext):
     Проверяет валидность, сохраняет и возвращает пользователя в меню профиля.
     """
     if await try_cancel(message, state):
+        return
+    
+    if not message.text:
+        await message.answer("🚫 Поддерживается только текстовый ввод данных.\n\n/cancel — отмена")
         return
     
     data = await state.get_data()
@@ -441,7 +1017,7 @@ async def step_edit_count(message: Message, state: FSMContext):
         )
         await state.clear()
     except ValueError:
-        await message.answer("🚫 Введите положительное число. Попробуйте ещё раз.")
+        await message.answer("🚫 Введите положительное число. Попробуйте ещё раз.\n\n/cancel — отмена")
 
 
 @wizard_router.message(ConfigWizard.edit_user_id)
@@ -453,6 +1029,10 @@ async def step_edit_user_id(message: Message, state: FSMContext):
     if await try_cancel(message, state):
         return
     
+    if not message.text:
+        await message.answer("🚫 Поддерживается только текстовый ввод данных.\n\n/cancel — отмена")
+        return
+    
     data = await state.get_data()
     idx = data["profile_index"]
 
@@ -462,19 +1042,26 @@ async def step_edit_user_id(message: Message, state: FSMContext):
         if chat_type == "channel":
             target_chat = user_input
             target_user = None
+            target_type = "channel"
+        elif chat_type == "unknown":
+            target_chat = user_input
+            target_user = None
+            target_type = "username"
         else:
-            await message.answer("🚫 Вы указали неправильный <b>username канала</b>. Попробуйте ещё раз.")
+            await message.answer("🚫 Вы указали неправильный <b>username канала</b>. Попробуйте ещё раз.\n\n/cancel — отмена")
             return
     elif user_input.isdigit():
         target_chat = None
         target_user = int(user_input)
+        target_type = "user_id"
     else:
-        await message.answer("🚫 Введите ID или @username канала. Попробуйте ещё раз.")
+        await message.answer("🚫 Введите ID или @username канала. Попробуйте ещё раз.\n\n/cancel — отмена")
         return
     
     config = await get_valid_config(message.from_user.id)
     config["PROFILES"][idx]["TARGET_USER_ID"] = target_user
     config["PROFILES"][idx]["TARGET_CHAT_ID"] = target_chat
+    config["PROFILES"][idx]["TARGET_TYPE"] = target_type
     await save_config(config)
 
     try:
@@ -488,6 +1075,55 @@ async def step_edit_user_id(message: Message, state: FSMContext):
         )
     await state.clear()
 
+
+@wizard_router.callback_query(F.data == "choose_sender_bot")
+async def choose_sender_bot(call: CallbackQuery, state: FSMContext):
+    """
+    Обрабатывает выбор отправителя «Бот» при оформлении подарка.
+    """
+    await save_sender_and_finish(call, state, sender="bot")
+
+@wizard_router.callback_query(F.data == "choose_sender_userbot")
+async def choose_sender_userbot(call: CallbackQuery, state: FSMContext):
+    """
+    Обрабатывает выбор отправителя «Юзербот» при оформлении подарка.
+    """
+    await save_sender_and_finish(call, state, sender="userbot")
+
+async def save_sender_and_finish(call: CallbackQuery, state: FSMContext, sender: str):
+    """
+    Сохраняет выбранного отправителя (бот или юзербот) в состояние FSM 
+    и завершает процесс, возвращая пользователя в главное меню.
+    """
+    data = await state.get_data()
+    profile_data = data.get("profile_data")
+    idx = data.get("profile_index")  # None — новый, число — редактирование
+
+    if not profile_data:
+        await call.message.answer("❌ Ошибка: профиль не найден.")
+        await state.clear()
+        return
+    
+    profile_data["SENDER"] = sender
+
+    config = await get_valid_config(call.from_user.id)
+
+    if idx is None:
+        await add_profile(config, profile_data)
+        msg = "✅ <b>Новый профиль</b> создан."
+        await call.message.edit_text(msg)
+        await profiles_menu(call.message, call.from_user.id)
+    else:
+        await update_profile(config, idx, profile_data)
+        msg = f"✅ <b>Профиль {idx + 1}</b> обновлён."
+        await call.message.edit_text(msg)
+        await call.message.answer(
+            profile_text(config["PROFILES"][idx], idx, call.from_user.id),
+            reply_markup=profile_edit_keyboard(idx)
+        )
+
+    await state.clear()
+    await call.answer()
 
 @wizard_router.callback_query(F.data == "profile_add")
 async def on_profile_add(call: CallbackQuery, state: FSMContext):
@@ -510,6 +1146,10 @@ async def step_user_id(message: Message, state: FSMContext):
     """
     if await try_cancel(message, state):
         return
+    
+    if not message.text:
+        await message.answer("🚫 Поддерживается только текстовый ввод данных.\n\n/cancel — отмена")
+        return
 
     user_input = message.text.strip()
     if user_input.startswith("@"):
@@ -517,14 +1157,20 @@ async def step_user_id(message: Message, state: FSMContext):
         if chat_type == "channel":
             target_chat = user_input
             target_user = None
+            target_type = "channel"
+        elif chat_type == "unknown":
+            target_chat = user_input
+            target_user = None
+            target_type = "username"
         else:
-            await message.answer("🚫 Вы указали неправильный <b>username канала</b>. Попробуйте ещё раз.")
+            await message.answer("🚫 Вы указали неправильный <b>username канала</b>. Попробуйте ещё раз.\n\n/cancel — отмена")
             return
     elif user_input.isdigit():
         target_chat = None
         target_user = int(user_input)
+        target_type = "user_id"
     else:
-        await message.answer("🚫 Введите ID или @username канала. Попробуйте ещё раз.")
+        await message.answer("🚫 Введите ID или @username канала. Попробуйте ещё раз.\n\n/cancel — отмена")
         return
 
     data = await state.get_data()
@@ -537,29 +1183,33 @@ async def step_user_id(message: Message, state: FSMContext):
         "COUNT": data["COUNT"],
         "TARGET_USER_ID": target_user,
         "TARGET_CHAT_ID": target_chat,
+        "TARGET_TYPE": target_type,
         "BOUGHT": 0,
         "SPENT": 0,
         "DONE": False,
     }
 
-    config = await get_valid_config(message.from_user.id)
-    profile_index = data.get("profile_index")
+    await state.update_data(profile_data=profile_data)
 
-    if profile_index is None:
-        await add_profile(config, profile_data)
-        await message.answer("✅ <b>Новый профиль</b> создан.")
-    else:
-        await update_profile(config, profile_index, profile_data)
-        await message.answer(f"✅ <b>Профиль {profile_index+1}</b> обновлён.")
-
-    await state.clear()
-    await update_menu(bot=message.bot, chat_id=message.chat.id, user_id=message.from_user.id, message_id=message.message_id)
+    # Переход к шагу выбора отправителя
+    await message.answer("📤 Выберите <b>отправителя</b> подарков:\n\n"
+                         "🤖 <code>Бот</code> - покупки с баланса бота\n"
+                         "👤 <code>Юзербот</code> - покупки с баланса юзербота\n\n"
+                         "/cancel — отменить",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🤖 Бот", callback_data="choose_sender_bot"),
+                InlineKeyboardButton(text="👤 Юзербот", callback_data="choose_sender_userbot")
+            ]
+        ])
+    )
+    await state.set_state(ConfigWizard.gift_sender)
 
 
 @wizard_router.callback_query(F.data == "profiles_main_menu")
-async def start_callback(call: CallbackQuery, state: FSMContext):
+async def profiles_main_menu_callback(call: CallbackQuery, state: FSMContext):
     """
-    Показывает главное меню по нажатию кнопки "Вернуться в меню".
+    Показывает главное меню по нажатию кнопки "Меню".
     Очищает все состояния FSM для пользователя.
     """
     await state.clear()
@@ -592,12 +1242,16 @@ async def on_profile_delete_confirm(call: CallbackQuery, state: FSMContext):
     profiles = config.get("PROFILES", [])
     profile = profiles[idx]
     target_display = get_target_display(profile, call.from_user.id)
-    message = (f"┌🔘 <b>Профиль {idx+1}</b> (куплено {profile.get('BOUGHT'):,} из {profile.get('COUNT'):,})\n"
+    profile_name = f'Профиль {idx + 1}' if  not profile['NAME'] else profile['NAME']
+    sender = '<code>Бот</code>' if profile['SENDER'] == 'bot' else '<code>Юзербот</code>'
+    message = (f"┌🏷️ <b>{profile_name}</b> (куплено {profile.get('BOUGHT'):,} из {profile.get('COUNT'):,})\n"
             f"├💰 <b>Цена</b>: {profile.get('MIN_PRICE'):,} – {profile.get('MAX_PRICE'):,} ★\n"
             f"├📦 <b>Саплай</b>: {profile.get('MIN_SUPPLY'):,} – {profile.get('MAX_SUPPLY'):,}\n"
-            f"└👤 <b>Получатель</b>: {target_display}")
+            f"├⭐️ <b>Лимит</b>: {profile.get('SPENT'):,} / {profile.get('LIMIT'):,} ★\n"
+            f"├👤 <b>Получатель</b>: {target_display}\n"
+            f"└📤 <b>Отправитель</b>: {sender}")
     await call.message.edit_text(
-        f"⚠️ Вы уверены, что хотите удалить <b>профиль {idx+1}</b>?\n\n{message}",
+        f"⚠️ Вы уверены, что хотите <b>удалить</b> профиль?\n\n{message}",
         reply_markup=kb
     )
     await call.answer()
@@ -610,12 +1264,13 @@ async def on_profile_delete_final(call: CallbackQuery):
     """
     idx = int(call.data.split("_")[-1])
     config = await get_valid_config(call.from_user.id)
-    deafult_added = "\n➕ <b>Добавлен</b> стандартный профиль.\n🚦 Статус изменён на 🔴 (неактивен)." if len(config["PROFILES"]) == 1 else ""
+    deafult_added = ("\n➕ <b>Добавлен</b> стандартный профиль.\n"
+                     "🚦 Статус изменён на 🔴 (неактивен)." if len(config["PROFILES"]) == 1 else "")
     if len(config["PROFILES"]) == 1:
         config["ACTIVE"] = False
         await save_config(config)
     await remove_profile(config, idx, call.from_user.id)
-    await call.message.edit_text(f"✅ <b>Профиль {idx+1}</b> удалён.{deafult_added}", reply_markup=None)
+    await call.message.edit_text(f"✅ <b>Профиль {idx + 1}</b> удалён.{deafult_added}", reply_markup=None)
     await profiles_menu(call.message, call.from_user.id)
     await call.answer()
 
@@ -664,6 +1319,10 @@ async def step_min_price(message: Message, state: FSMContext):
     if await try_cancel(message, state):
         return
     
+    if not message.text:
+        await message.answer("🚫 Поддерживается только текстовый ввод данных.\n\n/cancel — отмена")
+        return
+    
     try:
         value = int(message.text)
         if value <= 0:
@@ -672,7 +1331,7 @@ async def step_min_price(message: Message, state: FSMContext):
         await message.answer("💰 Максимальная цена подарка, например: <code>10000</code>\n\n/cancel — отменить")
         await state.set_state(ConfigWizard.max_price)
     except ValueError:
-        await message.answer("🚫 Введите положительное число. Попробуйте ещё раз.")
+        await message.answer("🚫 Введите положительное число. Попробуйте ещё раз.\n\n/cancel — отмена")
 
 
 @wizard_router.message(ConfigWizard.max_price)
@@ -683,6 +1342,10 @@ async def step_max_price(message: Message, state: FSMContext):
     if await try_cancel(message, state):
         return
     
+    if not message.text:
+        await message.answer("🚫 Поддерживается только текстовый ввод данных.\n\n/cancel — отмена")
+        return
+    
     try:
         value = int(message.text)
         if value <= 0:
@@ -691,14 +1354,14 @@ async def step_max_price(message: Message, state: FSMContext):
         data = await state.get_data()
         min_price = data.get("MIN_PRICE")
         if min_price and value < min_price:
-            await message.answer("🚫 Максимальная цена не может быть меньше минимальной. Попробуйте ещё раз.")
+            await message.answer("🚫 Максимальная цена не может быть меньше минимальной. Попробуйте ещё раз.\n\n/cancel — отмена")
             return
 
         await state.update_data(MAX_PRICE=value)
         await message.answer("📦 Минимальный саплай подарка, например: <code>1000</code>\n\n/cancel — отменить")
         await state.set_state(ConfigWizard.min_supply)
     except ValueError:
-        await message.answer("🚫 Введите положительное число. Попробуйте ещё раз.")
+        await message.answer("🚫 Введите положительное число. Попробуйте ещё раз.\n\n/cancel — отмена")
 
 
 @wizard_router.message(ConfigWizard.min_supply)
@@ -709,6 +1372,10 @@ async def step_min_supply(message: Message, state: FSMContext):
     if await try_cancel(message, state):
         return
     
+    if not message.text:
+        await message.answer("🚫 Поддерживается только текстовый ввод данных.\n\n/cancel — отмена")
+        return
+    
     try:
         value = int(message.text)
         if value <= 0:
@@ -717,7 +1384,7 @@ async def step_min_supply(message: Message, state: FSMContext):
         await message.answer("📦 Максимальный саплай подарка, например: <code>10000</code>\n\n/cancel — отменить")
         await state.set_state(ConfigWizard.max_supply)
     except ValueError:
-        await message.answer("🚫 Введите положительное число. Попробуйте ещё раз.")
+        await message.answer("🚫 Введите положительное число. Попробуйте ещё раз.\n\n/cancel — отмена")
 
 
 @wizard_router.message(ConfigWizard.max_supply)
@@ -728,6 +1395,10 @@ async def step_max_supply(message: Message, state: FSMContext):
     if await try_cancel(message, state):
         return
     
+    if not message.text:
+        await message.answer("🚫 Поддерживается только текстовый ввод данных.\n\n/cancel — отмена")
+        return
+    
     try:
         value = int(message.text)
         if value <= 0:
@@ -736,14 +1407,14 @@ async def step_max_supply(message: Message, state: FSMContext):
         data = await state.get_data()
         min_supply = data.get("MIN_SUPPLY")
         if min_supply and value < min_supply:
-            await message.answer("🚫 Максимальный саплай не может быть меньше минимального. Попробуйте ещё раз.")
+            await message.answer("🚫 Максимальный саплай не может быть меньше минимального. Попробуйте ещё раз.\n\n/cancel — отмена")
             return
 
         await state.update_data(MAX_SUPPLY=value)
         await message.answer("🎁 Максимальное количество подарков, например: <code>5</code>\n\n/cancel — отменить")
         await state.set_state(ConfigWizard.count)
     except ValueError:
-        await message.answer("🚫 Введите положительное число. Попробуйте ещё раз.")
+        await message.answer("🚫 Введите положительное число. Попробуйте ещё раз.\n\n/cancel — отмена")
 
 
 @wizard_router.message(ConfigWizard.count)
@@ -752,6 +1423,10 @@ async def step_count(message: Message, state: FSMContext):
     Обработка ввода количества подарков.
     """
     if await try_cancel(message, state):
+        return
+    
+    if not message.text:
+        await message.answer("🚫 Поддерживается только текстовый ввод данных.\n\n/cancel — отмена")
         return
 
     try:
@@ -765,7 +1440,7 @@ async def step_count(message: Message, state: FSMContext):
         )
         await state.set_state(ConfigWizard.limit)
     except ValueError:
-        await message.answer("🚫 Введите положительное число. Попробуйте ещё раз.")
+        await message.answer("🚫 Введите положительное число. Попробуйте ещё раз.\n\n/cancel — отмена")
 
 
 @wizard_router.message(ConfigWizard.limit)
@@ -775,22 +1450,30 @@ async def step_limit(message: Message, state: FSMContext):
     """
     if await try_cancel(message, state):
         return
+    
+    if not message.text:
+        await message.answer("🚫 Поддерживается только текстовый ввод данных.\n\n/cancel — отмена")
+        return
 
     try:
         value = int(message.text)
         if value <= 0:
             raise ValueError
         await state.update_data(LIMIT=value)
-        await message.answer(
-            "👤 Введите адрес получателя:\n\n"
-            f"• <b>ID пользователя</b> (например ваш: <code>{message.from_user.id}</code>)\n"
-            "• Или <b>username канала</b> (например: <code>@channel</code>)\n\n"
-            "❗️ Узнать ID пользователя тут @userinfobot\n\n"
-            "/cancel — отменить"
-        )
+        message_text = ("📥 Введите <b>получателя</b> подарка:\n\n"
+                        "🤖 Если <b>отправитель</b> <code>Бот</code> введите:\n"
+                        f"➤ <b>ID пользователя</b> (например ваш: <code>{message.from_user.id}</code>)\n"
+                        "➤ <b>username канала</b> (например: <code>@pepeksey</code>)\n\n"
+                        "👤 Если <b>отправитель</b> <code>Юзербот</code> введите:\n"
+                        "➤ <b>username</b> пользователя (например: <code>@leozizu</code>)\n"
+                        "➤ <b>username</b> канала (например: <code>@pepeksey</code>)\n\n"
+                        "🔎 <b>Узнать ID пользователя</b> можно тут: @userinfobot\n\n"
+                        "⚠️ Чтобы аккаунт <code>Юзербота</code> отправил подарок на другой аккаунт, между аккаунтами должна быть переписка.\n\n"
+                        "/cancel — отменить")
+        await message.answer(message_text)
         await state.set_state(ConfigWizard.user_id)
     except ValueError:
-        await message.answer("🚫 Введите положительное число. Попробуйте ещё раз.")
+        await message.answer("🚫 Введите положительное число. Попробуйте ещё раз.\n\n/cancel — отмена")
 
 
 @wizard_router.callback_query(F.data == "deposit_menu")
@@ -810,6 +1493,10 @@ async def deposit_amount_input(message: Message, state: FSMContext):
     """
     if await try_cancel(message, state):
         return
+    
+    if not message.text:
+        await message.answer("🚫 Поддерживается только текстовый ввод данных.\n\n/cancel — отмена")
+        return
 
     try:
         amount = int(message.text)
@@ -828,7 +1515,7 @@ async def deposit_amount_input(message: Message, state: FSMContext):
         )
         await state.clear()
     except ValueError:
-        await message.answer("🚫 Введите число от 1 до 10000. Попробуйте ещё раз.")
+        await message.answer("🚫 Введите число от 1 до 10000. Попробуйте ещё раз.\n\n/cancel — отмена")
 
 
 @wizard_router.callback_query(F.data == "refund_menu")
@@ -836,7 +1523,13 @@ async def refund_menu(call: CallbackQuery, state: FSMContext):
     """
     Переход к возврату звёзд (по ID транзакции).
     """
-    await call.message.answer("🆔 Введите ID транзакции для возврата:\n\n/withdraw_all — вывести весь баланс\n/cancel — отменить")
+    await call.message.answer("↩️ <b>Вывод звёзд с</b> <code>Бота</code>.\n\n"
+                              "📤 Отправьте в следующем сообщении <b>ID транзакции</b>.\n\n"
+                              "🛠 Дополнительные возможности:\n\n"
+                              "/withdraw_all — вывести весь баланс.\n\n"
+                              "/refund + <code>[user_id]</code> + <code>[transaction_id]</code> — вернуть звёзды конкретному пользователю по <b>id транзакции</b>. Например: <code>/refund 12345678 abCdEF1g23hkL</code>\n\n"
+                              "🚫 Вывести звёзды с <code>Юзербота</code> нельзя.\n\n"
+                              "/cancel — отменить")
     await state.set_state(ConfigWizard.refund_id)
     await call.answer()
 
@@ -846,9 +1539,18 @@ async def refund_input(message: Message, state: FSMContext):
     """
     Обработка возврата по ID транзакции. Также поддерживается команда /withdraw_all.
     """
+    if not message.text:
+        await message.answer("🚫 Поддерживается только текстовый ввод данных.\n\n/cancel — отмена")
+        return
+    
     if message.text and message.text.strip().lower() == "/withdraw_all":
         await state.clear()
         await withdraw_all_handler(message)
+        return
+    
+    if message.text and message.text.strip().lower() == "/refund":
+        await state.clear()
+        await refund_handler(message)
         return
     
     if await try_cancel(message, state):
@@ -885,6 +1587,10 @@ async def guest_deposit_amount_input(message: Message, state: FSMContext):
     """
     if await try_cancel(message, state):
         return
+    
+    if not message.text:
+        await message.answer("🚫 Поддерживается только текстовый ввод данных.\n\n⚠️ Операция завершена, попробуйте заново.")
+        return
 
     try:
         amount = int(message.text)
@@ -903,43 +1609,19 @@ async def guest_deposit_amount_input(message: Message, state: FSMContext):
         )
         await state.clear()
     except ValueError:
-        await message.answer("🚫 Введите число от 1 до 10000. Попробуйте ещё раз.")
-
-
-@wizard_router.callback_query(F.data == "guest_refund_menu")
-async def guest_refund_menu(call: CallbackQuery, state: FSMContext):
-    """
-    Переход к возврату звёзд для гостей (по ID транзакции).
-    """
-    await call.message.answer("🆔 Введите ID транзакции для возврата:")
-    await state.set_state(ConfigWizard.guest_refund_id)
-    await call.answer()
-
-
-@wizard_router.message(ConfigWizard.guest_refund_id)
-async def guest_refund_input(message: Message, state: FSMContext):
-    """
-    Обработка возврата по ID транзакции для гостей.
-    """
-    if await try_cancel(message, state):
-        return
-
-    txn_id = message.text.strip()
-    try:
-        await message.bot.refund_star_payment(
-            user_id=message.from_user.id,
-            telegram_payment_charge_id=txn_id
-        )
         await state.clear()
-    except Exception as e:
-        await message.answer(f"🚫 Ошибка при возврате:\n<code>{e}</code>")
-
+        await message.answer("🚫 Ожидается число от 1 до 10000.\n\n⚠️ Операция завершена, попробуйте заново.")
+        
 
 @wizard_router.message(Command("withdraw_all"))
 async def withdraw_all_handler(message: Message):
     """
     Запрос подтверждения на вывод всех звёзд с баланса.
     """
+    if message.from_user.id not in ALLOWED_USER_IDS:
+            await show_guest_menu(message)
+            return
+    
     balance = await refresh_balance(message.bot)
     if balance == 0:
         await message.answer("⚠️ Не найдено звёзд для возврата.")
@@ -1006,6 +1688,50 @@ async def withdraw_all_cancel(call: CallbackQuery):
     await update_menu(bot=call.bot, chat_id=call.message.chat.id, user_id=call.from_user.id, message_id=call.message.message_id)
 
 
+@wizard_router.message(Command("refund"))
+async def refund_handler(message: Message):
+    """
+    Обрабатывает команду /refund.
+    """
+    if message.from_user.id not in ALLOWED_USER_IDS:
+        await show_guest_menu(message)
+        return
+    
+    if await try_cancel(message, None):
+        return
+    
+    parts = message.text.strip().split()
+
+    if len(parts) != 3:
+        await message.answer(
+            "🚫 Неправильный формат команды."
+        )
+        await update_menu(bot=message.bot, chat_id=message.chat.id, user_id=message.from_user.id, message_id=message.message_id)
+        return
+
+    _, user_id_str, txn_id = parts
+
+    try:
+        user_id = int(user_id_str)
+    except ValueError:
+        await message.answer("🚫 Неверный формат <code>[user_id]</code>. Используйте целое число.")
+        await update_menu(bot=message.bot, chat_id=message.chat.id, user_id=message.from_user.id, message_id=message.message_id)
+        return
+
+    try:
+        await message.bot.refund_star_payment(
+            user_id=user_id,
+            telegram_payment_charge_id=txn_id
+        )
+        await message.answer(f"✅ Возврат по транзакции <code>{txn_id}</code> для пользователя <code>{user_id}</code> выполнен.")
+        await update_menu(bot=message.bot, chat_id=message.chat.id, user_id=message.from_user.id, message_id=message.message_id)
+    except Exception as e:
+        error_text = str(e)
+        short_error = error_text.split(":")[-1].strip()
+        await message.answer(f"🚫 Ошибка при возврате по транзакции <code>{txn_id}</code>:\n\n<code>{short_error}</code>")
+        await update_menu(bot=message.bot, chat_id=message.chat.id, user_id=message.from_user.id, message_id=message.message_id)
+
+
 # ------------- Дополнительные функции ---------------------
 
 
@@ -1041,7 +1767,11 @@ async def get_chat_type(bot: Bot, username: str):
         else:
             return chat.type  # на всякий случай
     except TelegramAPIError as e:
-        return f"error: {e}"
+        logger.error(f"TelegramAPIError при получении юзернейма канала: {e}")
+        return "unknown"
+    except Exception as e:
+        logger.error(f"Ошибка при получении юзернейма канала: {e}")
+        return "unknown"
     
 
 def register_wizard_handlers(dp):

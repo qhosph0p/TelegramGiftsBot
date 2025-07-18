@@ -10,15 +10,21 @@ import aiofiles
 logger = logging.getLogger(__name__)
 
 CURRENCY = 'XTR'
-VERSION = '1.2.0'
+VERSION = '1.3.0'
 CONFIG_PATH = "config.json"
 DEV_MODE = False # Покупка тестовых подарков
 MAX_PROFILES = 3 # Максимальная длина сообщения 4096 символов
 PURCHASE_COOLDOWN = 0.3 # Количество покупок в секунду
+USERBOT_UPDATE_COOLDOWN = 50 # Базовая величина ожидания в секундах для запроса списка подарков через юзербот
+ALLOWED_USER_IDS = []
+
+def add_allowed_user(user_id):
+    ALLOWED_USER_IDS.append(user_id)
 
 def DEFAULT_PROFILE(user_id: int) -> dict:
     """Создаёт профиль с дефолтными настройками для указанного пользователя."""
     return {
+        "NAME": None,
         "MIN_PRICE": 5000,
         "MAX_PRICE": 10000,
         "MIN_SUPPLY": 1000,
@@ -27,6 +33,8 @@ def DEFAULT_PROFILE(user_id: int) -> dict:
         "COUNT": 5,
         "TARGET_USER_ID": user_id,
         "TARGET_CHAT_ID": None,
+        "TARGET_TYPE": None,
+        "SENDER": "bot",
         "BOUGHT": 0,
         "SPENT": 0,
         "DONE": False
@@ -38,11 +46,21 @@ def DEFAULT_CONFIG(user_id: int) -> dict:
         "BALANCE": 0,
         "ACTIVE": False,
         "LAST_MENU_MESSAGE_ID": None,
-        "PROFILES": [DEFAULT_PROFILE(user_id)]
+        "PROFILES": [DEFAULT_PROFILE(user_id)],
+        "USERBOT": {
+            "API_ID": None,
+            "API_HASH": None,
+            "PHONE": None,
+            "USER_ID": None,
+            "USERNAME": None,
+            "BALANCE": 0,
+            "ENABLED": False
+        }
     }
 
 # Типы и требования для каждого поля профиля
 PROFILE_TYPES = {
+    "NAME": (str, True),
     "MIN_PRICE": (int, False),
     "MAX_PRICE": (int, False),
     "MIN_SUPPLY": (int, False),
@@ -51,6 +69,8 @@ PROFILE_TYPES = {
     "COUNT": (int, False),
     "TARGET_USER_ID": (int, True),
     "TARGET_CHAT_ID": (str, True),
+    "TARGET_TYPE": (str, True),
+    "SENDER": (str, True),
     "BOUGHT": (int, False),
     "SPENT": (int, False),
     "DONE": (bool, False),
@@ -61,7 +81,8 @@ CONFIG_TYPES = {
     "BALANCE": (int, False),
     "ACTIVE": (bool, False),
     "LAST_MENU_MESSAGE_ID": (int, True),
-    "PROFILES": (list, False),  # список профилей
+    "PROFILES": (list, False),
+    "USERBOT": (dict, False)
 }
 
 
@@ -135,6 +156,14 @@ async def validate_config(config: dict, user_id: int) -> dict:
             if not valid_profiles:
                 valid_profiles = [DEFAULT_PROFILE(user_id)]
             valid["PROFILES"] = valid_profiles
+        elif key == "USERBOT":
+            userbot_data = config.get("USERBOT", {})
+            default_userbot = default["USERBOT"]
+            valid_userbot = {}
+            for sub_key, default_value in default_userbot.items():
+                value = userbot_data.get(sub_key, default_value)
+                valid_userbot[sub_key] = value
+            valid["USERBOT"] = valid_userbot
         else:
             if key not in config or not is_valid_type(config[key], expected_type, allow_none):
                 valid[key] = default[key]
@@ -271,27 +300,47 @@ def format_config_summary(config: dict, user_id: int) -> str:
     status_text = "🟢 Активен" if config.get("ACTIVE") else "🔴 Неактивен"
     balance = config.get("BALANCE", 0)
     profiles = config.get("PROFILES", [])
+    userbot = config.get("USERBOT", {})
+    userbot_balance = userbot.get("BALANCE", 0)
+    session_state = True if userbot.get("API_ID") and userbot.get("API_HASH") and userbot.get("PHONE") else False
 
     lines = [f"🚦 <b>Статус:</b> {status_text}"]
     for idx, profile in enumerate(profiles, 1):
         target_display = get_target_display(profile, user_id)
+        sender = '<code>Бот</code>' if profile['SENDER'] == 'bot' else f'<code>Юзербот</code>'
+        profile_name = f'Профиль {idx}' if  not profile['NAME'] else profile['NAME']
         state_profile = (
             " ✅ <b>(завершён)</b>" if profile.get('DONE')
             else " ⚠️ <b>(частично)</b>" if profile.get('SPENT', 0) > 0
             else ""
         )
+        userbot_state_profile = ' 🔕' if profile['SENDER'] == 'userbot' and (not session_state or userbot.get('ENABLED') == False) else ''
         line = (
             "\n"
-            f"┌🔘 <b>Профиль {idx}</b>{state_profile}\n"
+            f"┌🏷️ <b>{profile_name}</b>{userbot_state_profile}{state_profile}\n"
             f"├💰 <b>Цена</b>: {profile.get('MIN_PRICE'):,} – {profile.get('MAX_PRICE'):,} ★\n"
             f"├📦 <b>Саплай</b>: {profile.get('MIN_SUPPLY'):,} – {profile.get('MAX_SUPPLY'):,}\n"
             f"├🎁 <b>Куплено</b>: {profile.get('BOUGHT'):,} / {profile.get('COUNT'):,}\n"
             f"├⭐️ <b>Лимит</b>: {profile.get('SPENT'):,} / {profile.get('LIMIT'):,} ★\n"
-            f"└👤 <b>Получатель</b>: {target_display}"
+            f"├👤 <b>Получатель</b>: {target_display}\n"
+            f"└📤 <b>Отправитель</b>: {sender}"
         )
         lines.append(line)
 
-    lines.append(f"\n💰 <b>Баланс</b>: {balance:,} ★")
+    # Баланс основного бота
+    lines.append(f"\n💰 <b>Баланс бота</b>: {balance:,} ★")
+
+    # Добавляем баланс userbot, если сессия активна
+    if session_state:
+        lines.append(
+            f"💰 <b>Баланс юзербота</b>: {userbot_balance:,} ★"
+            f"{' 🔕' if not userbot.get('ENABLED') else ''}"
+        )
+    else:
+        lines.append(
+            f"💰 <b>Баланс юзербота</b>: Не подключён!"
+        )
+
     return "\n".join(lines)
 
 
@@ -304,8 +353,12 @@ def get_target_display(profile: dict, user_id: int) -> str:
     """
     target_chat_id = profile.get("TARGET_CHAT_ID")
     target_user_id = profile.get("TARGET_USER_ID")
+    target_type = profile.get("TARGET_TYPE")
     if target_chat_id:
-        return f"{target_chat_id} (Канал)"
+        if target_type == "channel":
+            return f"{target_chat_id} (Канал)"
+        else:
+            return f"{target_chat_id}"
     elif str(target_user_id) == str(user_id):
         return f"<code>{target_user_id}</code> (Вы)"
     else:
@@ -315,7 +368,7 @@ def get_target_display(profile: dict, user_id: int) -> str:
 def get_target_display_local(target_user_id: int, target_chat_id: str, user_id: int) -> str:
     """Возвращает строковое описание получателя подарка на основе выбранного получателя и user_id."""
     if target_chat_id:
-        return f"{target_chat_id} (Канал)"
+        return f"{target_chat_id}"
     elif str(target_user_id) == str(user_id):
         return f"<code>{target_user_id}</code> (Вы)"
     else:

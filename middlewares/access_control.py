@@ -12,8 +12,8 @@ class AccessControlMiddleware(BaseMiddleware):
     Мидлварь доступа: разрешает работу только определённым user_id.
     Отклоняет все остальные запросы.
     """
-    FREE_CALLBACKS = {"guest_deposit_menu", "guest_refund_menu"}
-    FREE_STATES = {"ConfigWizard:guest_deposit_amount", "ConfigWizard:guest_refund_id"}
+    FREE_CALLBACKS = {"guest_deposit_menu"}
+    FREE_STATES = {"ConfigWizard:guest_deposit_amount"}
 
     def __init__(self, allowed_user_ids: list[int]):
         """
@@ -41,28 +41,35 @@ class AccessControlMiddleware(BaseMiddleware):
                     return await handler(event, data)
             # Разрешить сообщения-инвойсы (invoice)
             if isinstance(event, Message):
-                if getattr(event, "invoice", None):
+                if getattr(event, "invoice", None) or getattr(event, "successful_payment", None):
                     return await handler(event, data)
             # Всё остальное запрещаем
             try:
                 if isinstance(event, Message):
-                    kb = InlineKeyboardMarkup(
-                        inline_keyboard=[
-                            [
-                                InlineKeyboardButton(text="💰 Пополнить", callback_data="guest_deposit_menu"),
-                                InlineKeyboardButton(text="↩️ Вывести", callback_data="guest_refund_menu")
-                            ]
-                        ]
-                    )
-                    await event.answer( "✅ Вы можете <b>получать подарки</b> от этого бота.\n"
-                                        "💰 Вы можете <b>пополнить и вернуть</b> звёзды из бота.\n"
-                                        "⛔️ У вас <b>нет доступа</b> к панели управления.\n\n"
-                                        "<b>🤖 Исходный код: <a href=\"https://github.com/leozizu/TelegramGiftsBot\">GitHub</a></b>\n"
-                                        "<b>🐸 Автор: @leozizu</b>\n<b>📢 Канал: @pepeksey</b>",
-                                        reply_markup=kb)
+                    await show_guest_menu(event)
                 elif isinstance(event, CallbackQuery):
                     await event.answer("⛔️ Нет доступа", show_alert=True)
             except Exception as e:
                 logger.error(f"Не удалось отправить отказ пользователю {user.id}: {e}")
             return
         return await handler(event, data)
+    
+async def show_guest_menu(message: Message):
+    """
+    Показывает гостевое меню для неразрешённых пользователей.
+    """
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="💰 Пополнить", callback_data="guest_deposit_menu")
+            ]
+        ]
+    )
+    await message.answer(
+        "✅ Вы можете <b>получать подарки</b> от этого бота.\n"
+        "💰 Вы можете <b>пополнить</b> звёзды в бот.\n"
+        "⛔️ У вас <b>нет доступа</b> к панели управления.\n\n"
+        "<b>🤖 Исходный код: <a href=\"https://github.com/leozizu/TelegramGiftsBot\">GitHub</a></b>\n"
+        "<b>🐸 Автор: @leozizu</b>\n<b>📢 Канал: @pepeksey</b>",
+        reply_markup=kb
+    )

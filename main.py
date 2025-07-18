@@ -3,12 +3,14 @@ import asyncio
 import logging
 import os
 import sys
+
 # --- Сторонние библиотеки ---
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
+
 # --- Внутренние модули ---
 from services.config import (
     ensure_config,
@@ -16,47 +18,38 @@ from services.config import (
     get_valid_config,
     get_target_display,
     migrate_config_if_needed,
+    add_allowed_user,
     DEFAULT_CONFIG,
     VERSION,
     PURCHASE_COOLDOWN
 )
 from services.menu import update_menu
 from services.balance import refresh_balance
-from services.gifts import get_filtered_gifts
-from services.buy import buy_gift
+from services.gifts_manager import get_best_gift_list, userbot_gifts_updater
+from services.buy_bot import buy_gift
+from services.buy_userbot import buy_gift_userbot
+from services.userbot import try_start_userbot_from_config
 from handlers.handlers_wizard import register_wizard_handlers
 from handlers.handlers_catalog import register_catalog_handlers
 from handlers.handlers_main import register_main_handlers
 from utils.logging import setup_logging
+from utils.proxy import get_aiohttp_session
 from middlewares.access_control import AccessControlMiddleware
 from middlewares.rate_limit import RateLimitMiddleware
 
-load_dotenv()
+load_dotenv(override=False)
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 USER_ID = int(os.getenv("TELEGRAM_USER_ID"))
 default_config = DEFAULT_CONFIG(USER_ID)
 ALLOWED_USER_IDS = []
 ALLOWED_USER_IDS.append(USER_ID)
+add_allowed_user(USER_ID)
 
 setup_logging()
 logger = logging.getLogger(__name__)
 
-bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-dp = Dispatcher(storage=MemoryStorage())
-dp.message.middleware(RateLimitMiddleware(commands_limits={"/start": 3, "/withdraw_all": 3}, allowed_user_ids=ALLOWED_USER_IDS))
-dp.message.middleware(AccessControlMiddleware(ALLOWED_USER_IDS))
-dp.callback_query.middleware(AccessControlMiddleware(ALLOWED_USER_IDS))
 
-register_wizard_handlers(dp)
-register_catalog_handlers(dp)
-register_main_handlers(
-    dp=dp,
-    bot=bot,
-    version=VERSION
-)
-
-
-async def gift_purchase_worker():
+async def gift_purchase_worker(bot):
     """
     Фоновый воркер для покупки подарков по профилям.
     Теперь учитывает параметр LIMIT — максимальную сумму звёзд, которую можно потратить на профиль.
@@ -80,19 +73,19 @@ async def gift_purchase_worker():
                 # Пропускаем завершённые профили
                 if profile.get("DONE"):
                     continue
+                # Пропускаем профили с выключенным юзерботом
+                sender = profile.get("SENDER", "bot")
+                if sender == "userbot":
+                    userbot_config = config.get("USERBOT", {})
+                    if not userbot_config.get("ENABLED", False):
+                        continue
 
-                MIN_PRICE = profile["MIN_PRICE"]
-                MAX_PRICE = profile["MAX_PRICE"]
-                MIN_SUPPLY = profile["MIN_SUPPLY"]
-                MAX_SUPPLY = profile["MAX_SUPPLY"]
                 COUNT = profile["COUNT"]
                 LIMIT = profile.get("LIMIT", 0)
                 TARGET_USER_ID = profile["TARGET_USER_ID"]
                 TARGET_CHAT_ID = profile["TARGET_CHAT_ID"]
 
-                filtered_gifts = await get_filtered_gifts(
-                    bot, MIN_PRICE, MAX_PRICE, MIN_SUPPLY, MAX_SUPPLY
-                )
+                filtered_gifts = await get_best_gift_list(bot, profile)
 
                 if not filtered_gifts:
                     continue
@@ -110,15 +103,31 @@ async def gift_purchase_worker():
                     # Проверяем лимит перед каждой покупкой
                     while (profile["BOUGHT"] < COUNT and
                            profile["SPENT"] + gift_price <= LIMIT):
-                        success = await buy_gift(
-                            bot=bot,
-                            env_user_id=USER_ID,
-                            gift_id=gift_id,
-                            user_id=TARGET_USER_ID,
-                            chat_id=TARGET_CHAT_ID,
-                            gift_price=gift_price,
-                            file_id=sticker_file_id
-                        )
+
+                        sender = profile.get("SENDER", "bot")
+                        if sender == "bot":
+                            success = await buy_gift(
+                                bot=bot,
+                                env_user_id=USER_ID,
+                                gift_id=gift_id,
+                                user_id=TARGET_USER_ID,
+                                chat_id=TARGET_CHAT_ID,
+                                gift_price=gift_price,
+                                file_id=sticker_file_id
+                            )
+                        elif sender == "userbot":
+                            userbot_config = config.get("USERBOT", {})
+                            success = await buy_gift_userbot(
+                                session_user_id=USER_ID,
+                                gift_id=gift_id,
+                                target_user_id=TARGET_USER_ID,
+                                target_chat_id=TARGET_CHAT_ID,
+                                gift_price=gift_price,
+                                file_id=sticker_file_id
+                            )
+                        else:
+                            logger.warning(f"Неизвестный отправитель SENDER={sender} в профиле {profile_index}")
+                            success = False
 
                         if not success:
                             any_success = False
@@ -212,7 +221,9 @@ async def gift_purchase_worker():
                 )
                 config["ACTIVE"] = False
                 await save_config(config)
-                text = "⚠️ Найдены подходящие подарки, но <b>не удалось</b> купить.\n💰 Пополните баланс!\n🚦 Статус изменён на 🔴 (неактивен)."
+                text = ("⚠️ Найдены подходящие подарки, но <b>не удалось</b> купить."
+                        "\n💰 Пополните баланс! Проверьте адрес получателя!"
+                        "\n🚦 Статус изменён на 🔴 (неактивен).")
                 message = await bot.send_message(chat_id=USER_ID, text=text)
                 await update_menu(
                     bot=bot, chat_id=USER_ID, user_id=USER_ID, message_id=message.message_id
@@ -247,12 +258,47 @@ async def gift_purchase_worker():
 
 async def main() -> None:
     """
-    Точка входа: инициализация, запуск обновления баланса, запуск polling.
+    Асинхронная точка входа в приложение.
+
+    - Мигрирует и проверяет конфигурационный файл (config.json)
+    - Создаёт HTTP-сессию и объект бота
+    - Подключает middleware (ограничения и доступ)
+    - Регистрирует хендлеры
+    - Запускает userbot (если он настроен)
+    - Запускает фоновые задачи (покупки, обновление кеша подарков)
+    - Запускает polling через aiogram Dispatcher
     """
     logger.info("Бот запущен!")
     await migrate_config_if_needed(USER_ID)
     await ensure_config(USER_ID)
-    asyncio.create_task(gift_purchase_worker())
+
+    session = await get_aiohttp_session(USER_ID)
+    bot = Bot(token=TOKEN, session=session, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    dp = Dispatcher(storage=MemoryStorage())
+    dp.message.middleware(RateLimitMiddleware(
+        commands_limits={"/start": 10, "/withdraw_all": 10, "/refund": 10}, 
+        allowed_user_ids=ALLOWED_USER_IDS
+    ))
+    dp.callback_query.middleware(RateLimitMiddleware(
+        commands_limits={"guest_deposit_menu": 10},
+        allowed_user_ids=ALLOWED_USER_IDS
+    ))
+    dp.message.middleware(AccessControlMiddleware(ALLOWED_USER_IDS))
+    dp.callback_query.middleware(AccessControlMiddleware(ALLOWED_USER_IDS))
+
+    register_wizard_handlers(dp)
+    register_catalog_handlers(dp)
+    register_main_handlers(
+        dp=dp,
+        bot=bot,
+        version=VERSION
+    )
+
+    # Запуск userbot, если сессия уже существует
+    await try_start_userbot_from_config(USER_ID)
+
+    asyncio.create_task(gift_purchase_worker(bot))
+    asyncio.create_task(userbot_gifts_updater(USER_ID))
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
