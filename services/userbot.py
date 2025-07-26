@@ -19,7 +19,6 @@ from pyrogram.errors import (
 
 # --- Внутренние библиотеки ---
 from services.config import get_valid_config, save_config
-from utils.proxy import get_userbot_proxy
 
 logger = logging.getLogger(__name__)
 
