@@ -22,7 +22,7 @@ async def get_aiohttp_session(user_id: int) -> AiohttpSession | None:
     """
     db_proxy = await get_proxy_data(user_id)
     if not db_proxy: return None
-    proxy_url = f"socks5://{db_proxy.get("username")}:{db_proxy.get("password")}@{db_proxy.get("hostname")}:{db_proxy.get("port")}"
+    proxy_url = f"socks5://{db_proxy.get('username')}:{db_proxy.get('password')}@{db_proxy.get('hostname')}:{db_proxy.get('port')}"
     if proxy_url:
         return AiohttpSession(proxy=proxy_url)
     else:
