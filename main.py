@@ -33,7 +33,6 @@ from handlers.handlers_wizard import register_wizard_handlers
 from handlers.handlers_catalog import register_catalog_handlers
 from handlers.handlers_main import register_main_handlers
 from utils.logging import setup_logging
-from utils.proxy import get_aiohttp_session
 from middlewares.access_control import AccessControlMiddleware
 from middlewares.rate_limit import RateLimitMiddleware
 
